@@ -52,6 +52,45 @@ func assistantText(content string) llmReply {
 	return llmReply{message: map[string]any{"role": "assistant", "content": content}}
 }
 
+// toolCall is one function call requested by a scripted assistant message.
+type toolCall struct {
+	id        string
+	name      string
+	arguments string // JSON-encoded, exactly as the model would send it
+}
+
+// assistantToolCalls scripts an assistant message that requests tool calls.
+func assistantToolCalls(calls ...toolCall) llmReply {
+	toolCalls := make([]any, len(calls))
+	for i, call := range calls {
+		toolCalls[i] = map[string]any{
+			"id":   call.id,
+			"type": "function",
+			"function": map[string]any{
+				"name":      call.name,
+				"arguments": call.arguments,
+			},
+		}
+	}
+	return llmReply{message: map[string]any{
+		"role":       "assistant",
+		"content":    nil,
+		"tool_calls": toolCalls,
+	}}
+}
+
+// withContent returns a copy of the reply whose message also carries text, as
+// models often narrate what they are about to do alongside their tool calls.
+func (r llmReply) withContent(content string) llmReply {
+	message := make(map[string]any, len(r.message))
+	for key, value := range r.message {
+		message[key] = value
+	}
+	message["content"] = content
+	r.message = message
+	return r
+}
+
 // httpError scripts a failed request with the given HTTP status.
 func httpError(status int) llmReply {
 	return llmReply{status: status}

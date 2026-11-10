@@ -24,8 +24,8 @@ func main() {
 }
 
 // run is the program's testable entry point. It sends the prompt given with -p
-// to the LLM and writes the model's reply to stdout; anything else (usage,
-// errors) goes to stderr. It returns the process exit code.
+// to the LLM and writes the outcome to stdout; anything else (usage, errors)
+// goes to stderr. It returns the process exit code.
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("claude-code", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -50,23 +50,24 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 
 	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL))
-	reply, err := complete(ctx, client, *prompt)
+	output, err := complete(ctx, client, defaultToolbox(), *prompt)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprint(stdout, reply)
+	fmt.Fprint(stdout, output)
 	return 0
 }
 
-// complete sends the prompt to the LLM, advertising the available tools, and
-// returns the text of the model's reply.
-func complete(ctx context.Context, client openai.Client, prompt string) (string, error) {
+// complete sends the prompt to the LLM, advertising the tools in the toolbox.
+// If the model answers with a tool call, the tool is executed and its result
+// is returned; otherwise the text of the model's reply is returned.
+func complete(ctx context.Context, client openai.Client, toolbox Toolbox, prompt string) (string, error) {
 	resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Model:    model,
 		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)},
-		Tools:    availableTools(),
+		Tools:    toolbox.Specs(),
 	})
 	if err != nil {
 		return "", err
@@ -74,5 +75,13 @@ func complete(ctx context.Context, client openai.Client, prompt string) (string,
 	if len(resp.Choices) == 0 {
 		return "", errors.New("no choices in response")
 	}
-	return resp.Choices[0].Message.Content, nil
+
+	message := resp.Choices[0].Message
+	if len(message.ToolCalls) == 0 {
+		return message.Content, nil
+	}
+	// Only the first tool call is executed for now, and its result is the
+	// program's output.
+	call := message.ToolCalls[0].Function
+	return toolbox.Call(call.Name, call.Arguments)
 }
