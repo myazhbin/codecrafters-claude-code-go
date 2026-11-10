@@ -59,18 +59,23 @@ type toolCall struct {
 	arguments string // JSON-encoded, exactly as the model would send it
 }
 
+// wire returns the tool call as it appears in the API's JSON.
+func (c toolCall) wire() map[string]any {
+	return map[string]any{
+		"id":   c.id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      c.name,
+			"arguments": c.arguments,
+		},
+	}
+}
+
 // assistantToolCalls scripts an assistant message that requests tool calls.
 func assistantToolCalls(calls ...toolCall) llmReply {
 	toolCalls := make([]any, len(calls))
 	for i, call := range calls {
-		toolCalls[i] = map[string]any{
-			"id":   call.id,
-			"type": "function",
-			"function": map[string]any{
-				"name":      call.name,
-				"arguments": call.arguments,
-			},
-		}
+		toolCalls[i] = call.wire()
 	}
 	return llmReply{message: map[string]any{
 		"role":       "assistant",
@@ -189,6 +194,34 @@ func runCLIWithEnv(t *testing.T, env map[string]string, args ...string) (stdout,
 	getenv := func(key string) string { return env[key] }
 	code = run(context.Background(), args, getenv, &out, &errOut)
 	return out.String(), errOut.String(), code
+}
+
+// The helpers below build the messages a request is expected to carry, in the
+// generic form that request bodies are decoded into.
+
+func userMessage(content string) map[string]any {
+	return map[string]any{"role": "user", "content": content}
+}
+
+// assistantMessage is the echo of an assistant reply. Like the API client, it
+// leaves out the content when there is none.
+func assistantMessage(content string, calls ...toolCall) map[string]any {
+	message := map[string]any{"role": "assistant"}
+	if content != "" {
+		message["content"] = content
+	}
+	if len(calls) > 0 {
+		toolCalls := make([]any, len(calls))
+		for i, call := range calls {
+			toolCalls[i] = call.wire()
+		}
+		message["tool_calls"] = toolCalls
+	}
+	return message
+}
+
+func toolMessage(toolCallID, content string) map[string]any {
+	return map[string]any{"role": "tool", "tool_call_id": toolCallID, "content": content}
 }
 
 // decodeJSON parses a JSON document into its generic Go representation.

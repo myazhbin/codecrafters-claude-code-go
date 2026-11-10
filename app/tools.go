@@ -51,11 +51,7 @@ func (tb Toolbox) Specs() []openai.ChatCompletionToolUnionParam {
 func (tb Toolbox) Call(name, arguments string) (string, error) {
 	for _, tool := range tb {
 		if tool.Name == name {
-			result, err := tool.Run(arguments)
-			if err != nil {
-				return "", fmt.Errorf("%s: %w", name, err)
-			}
-			return result, nil
+			return tool.Run(arguments)
 		}
 	}
 	return "", fmt.Errorf("unknown tool %q", name)

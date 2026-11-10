@@ -37,9 +37,7 @@ func TestReadToolReturnsExactFileContents(t *testing.T) {
 
 func TestReadToolResolvesRelativePathsAgainstWorkingDirectory(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("relative!"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeFile(t, filepath.Join(dir, "notes.txt"), "relative!")
 	t.Chdir(dir)
 
 	got, err := readTool.Run(`{"file_path": "notes.txt"}`)
@@ -118,10 +116,20 @@ func TestToolboxCallRejectsUnknownTool(t *testing.T) {
 func writeTempFile(t *testing.T, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
+	writeFile(t, path, contents)
+	return path
+}
+
+// writeFile creates a file with the given contents, along with any missing
+// parent directories.
+func writeFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return path
 }
 
 // jsonArgs encodes tool arguments the way the model sends them: as a JSON
