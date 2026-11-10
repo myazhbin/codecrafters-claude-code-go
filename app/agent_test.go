@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -106,6 +107,48 @@ func TestAgentLoopExecutesEveryToolCallOfAResponse(t *testing.T) {
 		assistantMessage("", readA, readB),
 		toolMessage("call_a", "contents of a"),
 		toolMessage("call_b", "contents of b"),
+	)
+}
+
+func TestAgentLoopCreatesFileWithWriteTool(t *testing.T) {
+	const prompt = "Read README.md and create the required file. File should have 1 line. Reply with 'Created the file'"
+	const readme = "Create app/main.py containing a hello world program.\n"
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "README.md"), readme)
+	if err := os.Mkdir(filepath.Join(dir, "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	readCall := toolCall{id: "call_1", name: "Read", arguments: `{"file_path": "README.md"}`}
+	writeCall := toolCall{id: "call_2", name: "Write", arguments: `{"file_path": "app/main.py", "content": "print('Hello, World!')\n"}`}
+	llm := newFakeLLM(t,
+		assistantToolCalls(readCall),
+		assistantToolCalls(writeCall),
+		assistantText("Created the file"),
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", prompt)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "Created the file" {
+		t.Errorf("stdout = %q, want %q", stdout, "Created the file")
+	}
+	if got := readFile(t, filepath.Join(dir, "app", "main.py")); got != "print('Hello, World!')\n" {
+		t.Errorf("app/main.py contains %q, want %q", got, "print('Hello, World!')\n")
+	}
+
+	requests := llm.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("LLM received %d requests, want 3", len(requests))
+	}
+	assertMessages(t, requests[2],
+		userMessage(prompt),
+		assistantMessage("", readCall),
+		toolMessage("call_1", readme),
+		assistantMessage("", writeCall),
+		toolMessage("call_2", "Wrote 23 bytes to app/main.py"),
 	)
 }
 

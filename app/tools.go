@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/openai/openai-go/v3"
 )
@@ -34,7 +35,7 @@ type Toolbox []Tool
 
 // defaultToolbox returns the tools this program offers to the model.
 func defaultToolbox() Toolbox {
-	return Toolbox{readTool}
+	return Toolbox{readTool, writeTool}
 }
 
 // Specs returns the specification of every tool, to be sent with each request.
@@ -57,6 +58,14 @@ func (tb Toolbox) Call(name, arguments string) (string, error) {
 	return "", fmt.Errorf("unknown tool %q", name)
 }
 
+// decodeArguments parses the JSON-encoded arguments of a tool call.
+func decodeArguments(arguments string, into any) error {
+	if err := json.Unmarshal([]byte(arguments), into); err != nil {
+		return fmt.Errorf("invalid arguments: %w", err)
+	}
+	return nil
+}
+
 // readTool reads a file and returns its contents.
 var readTool = Tool{
 	Name:        "Read",
@@ -75,8 +84,8 @@ var readTool = Tool{
 		var args struct {
 			FilePath string `json:"file_path"`
 		}
-		if err := json.Unmarshal([]byte(arguments), &args); err != nil {
-			return "", fmt.Errorf("invalid arguments: %w", err)
+		if err := decodeArguments(arguments, &args); err != nil {
+			return "", err
 		}
 		if args.FilePath == "" {
 			return "", errors.New("file_path is required")
@@ -86,5 +95,50 @@ var readTool = Tool{
 			return "", err
 		}
 		return string(contents), nil
+	},
+}
+
+// writeTool writes content to a file, creating the file (and any missing
+// parent directory) or overwriting it if it already exists.
+var writeTool = Tool{
+	Name:        "Write",
+	Description: "Write content to a file",
+	Parameters: openai.FunctionParameters{
+		"type":     "object",
+		"required": []string{"file_path", "content"},
+		"properties": map[string]any{
+			"file_path": map[string]any{
+				"type":        "string",
+				"description": "The path of the file to write to",
+			},
+			"content": map[string]any{
+				"type":        "string",
+				"description": "The content to write to the file",
+			},
+		},
+	},
+	Run: func(arguments string) (string, error) {
+		var args struct {
+			FilePath string `json:"file_path"`
+			// A pointer tells a missing content apart from an empty one, which
+			// is a legitimate way to create an empty file.
+			Content *string `json:"content"`
+		}
+		if err := decodeArguments(arguments, &args); err != nil {
+			return "", err
+		}
+		if args.FilePath == "" {
+			return "", errors.New("file_path is required")
+		}
+		if args.Content == nil {
+			return "", errors.New("content is required")
+		}
+		if err := os.MkdirAll(filepath.Dir(args.FilePath), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(args.FilePath, []byte(*args.Content), 0o644); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Wrote %d bytes to %s", len(*args.Content), args.FilePath), nil
 	},
 }

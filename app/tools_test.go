@@ -77,6 +77,106 @@ func TestReadToolRejectsBadCalls(t *testing.T) {
 	}
 }
 
+func TestWriteToolCreatesFileWithExactContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{"single line", "print('hello')\n"},
+		{"no trailing newline", "no newline at the end"},
+		{"multiple lines", "line 1\nline 2\n\n  indented line 4\n"},
+		{"unicode", "héllo wörld 🍎\n"},
+		{"empty content", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "new_file.py")
+
+			result, err := writeTool.Run(jsonArgs(t, map[string]any{"file_path": path, "content": tt.content}))
+
+			if err != nil {
+				t.Fatalf("Write returned an error: %v", err)
+			}
+			if got := readFile(t, path); got != tt.content {
+				t.Errorf("file contains %q, want %q", got, tt.content)
+			}
+			if !strings.Contains(result, path) {
+				t.Errorf("result = %q, want it to name the written file %q", result, path)
+			}
+		})
+	}
+}
+
+func TestWriteToolOverwritesExistingFile(t *testing.T) {
+	path := writeTempFile(t, "notes.txt", "a much longer piece of old content\n")
+
+	if _, err := writeTool.Run(jsonArgs(t, map[string]any{"file_path": path, "content": "new\n"})); err != nil {
+		t.Fatalf("Write returned an error: %v", err)
+	}
+
+	if got := readFile(t, path); got != "new\n" {
+		t.Errorf("file contains %q, want the old content fully replaced by %q", got, "new\n")
+	}
+}
+
+func TestWriteToolCreatesMissingParentDirectories(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app", "utils", "helpers.py")
+
+	if _, err := writeTool.Run(jsonArgs(t, map[string]any{"file_path": path, "content": "x = 1\n"})); err != nil {
+		t.Fatalf("Write returned an error: %v", err)
+	}
+
+	if got := readFile(t, path); got != "x = 1\n" {
+		t.Errorf("file contains %q, want %q", got, "x = 1\n")
+	}
+}
+
+func TestWriteToolResolvesRelativePathsAgainstWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if _, err := writeTool.Run(`{"file_path": "app/main.py", "content": "relative!"}`); err != nil {
+		t.Fatalf("Write returned an error: %v", err)
+	}
+
+	if got := readFile(t, filepath.Join(dir, "app", "main.py")); got != "relative!" {
+		t.Errorf("file contains %q, want %q", got, "relative!")
+	}
+}
+
+func TestWriteToolRejectsBadCalls(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name      string
+		arguments string
+		wantErr   string
+	}{
+		{"malformed JSON", `{"file_path": `, "invalid arguments"},
+		{"empty arguments", ``, "invalid arguments"},
+		{"wrong argument type", `{"file_path": "a.txt", "content": 42}`, "invalid arguments"},
+		{"missing file_path", `{"content": "x"}`, "file_path is required"},
+		{"empty file_path", `{"file_path": "", "content": "x"}`, "file_path is required"},
+		{"missing content", jsonArgs(t, map[string]any{"file_path": filepath.Join(dir, "a.txt")}), "content is required"},
+		{"null content", `{"file_path": "a.txt", "content": null}`, "content is required"},
+		{"path is a directory", jsonArgs(t, map[string]any{"file_path": dir, "content": "x"}), "is a directory"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := writeTool.Run(tt.arguments)
+
+			if err == nil {
+				t.Fatalf("Write = %q, want an error mentioning %q", got, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("rejected calls left %d files behind, want none", len(entries))
+	}
+}
+
 func TestToolboxCallDispatchesByName(t *testing.T) {
 	var gotArguments string
 	toolbox := Toolbox{
@@ -130,6 +230,16 @@ func writeFile(t *testing.T, path, contents string) {
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// readFile returns the contents of a file that is expected to exist.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(contents)
 }
 
 // jsonArgs encodes tool arguments the way the model sends them: as a JSON

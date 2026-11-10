@@ -35,41 +35,68 @@ func TestRunSendsPromptAndPrintsReply(t *testing.T) {
 	}
 }
 
-func TestRunAdvertisesReadTool(t *testing.T) {
-	llm := newFakeLLM(t, assistantText("1"))
+func TestRunAdvertisesTools(t *testing.T) {
+	llm := newFakeLLM(t, assistantText("2"))
 
 	stdout, stderr, code := runCLI(t, llm, "-p", "How many tools are available to you in this request? Number only.")
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
 	}
-	if stdout != "1" {
-		t.Errorf("stdout = %q, want %q", stdout, "1")
+	if stdout != "2" {
+		t.Errorf("stdout = %q, want %q", stdout, "2")
 	}
 
-	want := decodeJSON(t, `{
-		"type": "function",
-		"function": {
-			"name": "Read",
-			"description": "Read and return the contents of a file",
-			"parameters": {
-				"type": "object",
-				"properties": {
-					"file_path": {
-						"type": "string",
-						"description": "The path to the file to read"
-					}
-				},
-				"required": ["file_path"]
+	want := map[string]string{
+		"Read": `{
+			"type": "function",
+			"function": {
+				"name": "Read",
+				"description": "Read and return the contents of a file",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"file_path": {
+							"type": "string",
+							"description": "The path to the file to read"
+						}
+					},
+					"required": ["file_path"]
+				}
 			}
-		}
-	}`)
-	tools := advertisedTools(t, llm.onlyRequest())
-	if got := tools["Read"]; !reflect.DeepEqual(got, want) {
-		t.Errorf("Read tool = %s\nwant %s", toJSON(t, got), toJSON(t, want))
+		}`,
+		"Write": `{
+			"type": "function",
+			"function": {
+				"name": "Write",
+				"description": "Write content to a file",
+				"parameters": {
+					"type": "object",
+					"required": ["file_path", "content"],
+					"properties": {
+						"file_path": {
+							"type": "string",
+							"description": "The path of the file to write to"
+						},
+						"content": {
+							"type": "string",
+							"description": "The content to write to the file"
+						}
+					}
+				}
+			}
+		}`,
 	}
-	if len(tools) != 1 {
-		t.Errorf("advertised %d tools, want only Read: %s", len(tools), toJSON(t, tools))
+	tools := advertisedTools(t, llm.onlyRequest())
+	for name, spec := range want {
+		if got, wantSpec := tools[name], decodeJSON(t, spec); !reflect.DeepEqual(got, wantSpec) {
+			t.Errorf("%s tool = %s\nwant %s", name, toJSON(t, got), toJSON(t, wantSpec))
+		}
+	}
+	for name := range tools {
+		if _, expected := want[name]; !expected {
+			t.Errorf("unexpected tool %q is advertised", name)
+		}
 	}
 }
 
