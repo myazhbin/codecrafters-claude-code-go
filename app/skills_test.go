@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -157,6 +159,35 @@ func TestParseSkill(t *testing.T) {
 				Body:        "Step one.\n---\ndescription: not part of the frontmatter\n---",
 				Dir:         dir,
 			},
+		},
+		{
+			name: "skill that asks for a subagent",
+			document: lines(
+				"---",
+				"name: apple",
+				"description: Use this skill when the user asks about the on-call rotation.",
+				"context: fork",
+				"---",
+				"",
+				"Respond with exactly one word: blueberry",
+			),
+			want: Skill{
+				Name:        "apple",
+				Description: "Use this skill when the user asks about the on-call rotation.",
+				Body:        "Respond with exactly one word: blueberry",
+				Dir:         dir,
+				Fork:        true,
+			},
+		},
+		{
+			name: "any other context does not ask for a subagent",
+			document: lines(
+				"---",
+				"name: apple",
+				"context: inline",
+				"---",
+			),
+			want: Skill{Name: "apple", Dir: dir},
 		},
 		{
 			name: "unquoted colon in the description",
@@ -475,6 +506,7 @@ func TestInvokedSkills(t *testing.T) {
 	skills := []Skill{
 		{Name: "apple", Dir: ".claude/skills/apple"},
 		{Name: "apple-pie_2", Dir: ".claude/skills/apple-pie_2"},
+		{Name: "fig", Dir: ".claude/skills/fig", Fork: true},
 		{Name: "grape", Dir: ".claude/skills/grape"},
 	}
 	tests := []struct {
@@ -501,6 +533,13 @@ func TestInvokedSkills(t *testing.T) {
 		{"/apple 4127 /grape", []string{"apple"}, "4127 /grape"},
 		{"/apple /pear 4127", []string{"apple"}, "/pear 4127"},
 		{"/apple / /grape", []string{"apple"}, "/ /grape"},
+		// A skill that runs in a subagent is never stacked with others.
+		{"/fig", []string{"fig"}, ""},
+		{"/fig 4127", []string{"fig"}, "4127"},
+		{"/fig /apple 4127", []string{"fig"}, "/apple 4127"},
+		{"/fig /fig", []string{"fig"}, "/fig"},
+		{"/apple /fig 4127", []string{"apple"}, "/fig 4127"},
+		{"/apple /grape /fig", []string{"apple", "grape"}, "/fig"},
 		// No skill.
 		{"/pear /apple 4127", nil, "/pear /apple 4127"},
 		{"/etc/hosts is what kind of file?", nil, "/etc/hosts is what kind of file?"},
@@ -990,6 +1029,9 @@ func TestSkillToolReturnsSkillInstructions(t *testing.T) {
 		{Name: "apple", Body: "Respond with exactly one word: blueberry", Dir: ".claude/skills/apple"},
 		{Name: "grape", Body: "Deploy $0 to $1. Request: $ARGUMENTS", Dir: ".claude/skills/grape"},
 		{Name: "melon", Body: "Run `scripts/checksum.sh`.", Dir: ".claude/skills/melon", Bundled: true},
+	}, func(context.Context, string) (string, error) {
+		t.Error("a skill that does not ask for a subagent ran in one")
+		return "", nil
 	})
 	tests := []struct {
 		name      string
@@ -1048,7 +1090,7 @@ func TestSkillToolRejectsBadCalls(t *testing.T) {
 	tool := newSkillTool([]Skill{
 		{Name: "apple", Body: "Respond with exactly one word: blueberry", Dir: ".claude/skills/apple"},
 		{Name: "grape", Dir: ".claude/skills/grape"},
-	})
+	}, nil)
 	tests := []struct {
 		name      string
 		arguments string
@@ -1160,6 +1202,252 @@ func TestRunLetsModelChooseSkill(t *testing.T) {
 		if strings.Contains(toJSON(t, request.Body), "raspberry") {
 			t.Errorf("request #%d discloses the body of a skill that was not chosen", i+1)
 		}
+	}
+}
+
+func TestSkillToolRunsForkedSkillInSubagent(t *testing.T) {
+	var prompts []string
+	tool := newSkillTool([]Skill{
+		{Name: "apple", Body: "Respond with exactly one word: $ARGUMENTS", Dir: ".claude/skills/apple", Fork: true},
+	}, func(_ context.Context, prompt string) (string, error) {
+		prompts = append(prompts, prompt)
+		return "blueberry", nil
+	})
+
+	got, err := tool.Run(context.Background(), `{"name": "apple", "args": "blueberry"}`)
+
+	if err != nil {
+		t.Fatalf("Skill returned an error: %v", err)
+	}
+	// The model gets the subagent's answer, not the skill's instructions.
+	if want := "Skill apple ran in a separate context and returned: blueberry"; got != want {
+		t.Errorf("Skill = %q\nwant %q", got, want)
+	}
+	if want := []string{"Respond with exactly one word: blueberry"}; !reflect.DeepEqual(prompts, want) {
+		t.Errorf("the subagent was given %q, want %q", prompts, want)
+	}
+}
+
+func TestSkillToolReportsSubagentFailure(t *testing.T) {
+	tool := newSkillTool([]Skill{
+		{Name: "apple", Body: "Respond with exactly one word: blueberry", Dir: ".claude/skills/apple", Fork: true},
+	}, func(context.Context, string) (string, error) {
+		return "", errors.New("the model is unreachable")
+	})
+
+	got, err := tool.Run(context.Background(), `{"name": "apple"}`)
+
+	if err == nil {
+		t.Fatalf("Skill = %q, want an error", got)
+	}
+	if want := `skill "apple" failed in its subagent: the model is unreachable`; err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+func TestRunRunsForkedSkillInSubagent(t *testing.T) {
+	const prompt = "Who is on the on-call rotation right now?"
+	const instructions = "Respond with exactly one word: blueberry"
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, skillsDir, "apple", skillFile), lines(
+		"---",
+		"name: apple",
+		"description: Use this skill when the user asks about the on-call rotation.",
+		"context: fork",
+		"---",
+		"",
+		instructions,
+	))
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "grape",
+		"Use this skill when the user asks to format source code.",
+		"Respond with exactly one word: raspberry")
+	t.Chdir(project)
+	useSkill := toolCall{id: "call_1", name: "Skill", arguments: `{"name": "apple"}`}
+	llm := newFakeLLM(t,
+		assistantToolCalls(useSkill),                        // the main agent picks the skill
+		assistantText("blueberry"),                          // the subagent answers
+		assistantText("The on-call engineer is blueberry."), // the main agent concludes
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", prompt)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "The on-call engineer is blueberry." {
+		t.Errorf("stdout = %q, want the main agent's answer", stdout)
+	}
+	requests := llm.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("LLM received %d requests, want 3", len(requests))
+	}
+	system := skillsSystemMessage(
+		"apple: Use this skill when the user asks about the on-call rotation.",
+		"grape: Use this skill when the user asks to format source code.",
+	)
+	assertMessages(t, requests[0], system, userMessage(prompt))
+
+	// The subagent starts from the skill's instructions and nothing else: no
+	// catalog of skills, and not the question that triggered it.
+	assertMessages(t, requests[1], userMessage(instructions))
+	subagentTools := advertisedTools(t, requests[1])
+	for _, name := range []string{"Read", "Write", "Bash"} {
+		if subagentTools[name] == nil {
+			t.Errorf("the subagent is not offered the %s tool", name)
+		}
+	}
+	if subagentTools["Skill"] != nil {
+		t.Errorf("the subagent is offered the Skill tool, want it kept to the main agent")
+	}
+
+	// Only the subagent's answer comes back to the main conversation.
+	assertMessages(t, requests[2],
+		system,
+		userMessage(prompt),
+		assistantMessage("", useSkill),
+		toolMessage("call_1", "Skill apple ran in a separate context and returned: blueberry"),
+	)
+	for _, i := range []int{0, 2} {
+		if strings.Contains(toJSON(t, requests[i].Body["messages"]), instructions) {
+			t.Errorf("request #%d carries the instructions of the forked skill into the main conversation", i+1)
+		}
+	}
+}
+
+func TestRunKeepsSubagentConversationSeparate(t *testing.T) {
+	const prompt = "Who is on the on-call rotation right now?"
+	const instructions = "Read `rotation.txt` and respond with the name it contains."
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, skillsDir, "apple", skillFile), lines(
+		"---",
+		"name: apple",
+		"description: Use this skill when the user asks about the on-call rotation.",
+		"context: fork",
+		"---",
+		"",
+		instructions,
+	))
+	writeFile(t, filepath.Join(project, "rotation.txt"), "blueberry\n")
+	t.Chdir(project)
+	useSkill := toolCall{id: "call_1", name: "Skill", arguments: `{"name": "apple"}`}
+	readFile := toolCall{id: "call_2", name: "Read", arguments: `{"file_path": "rotation.txt"}`}
+	llm := newFakeLLM(t,
+		assistantToolCalls(useSkill),      // main agent
+		assistantToolCalls(readFile),      // subagent
+		assistantText("blueberry"),        // subagent
+		assistantText("It is blueberry."), // main agent
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", prompt)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "It is blueberry." {
+		t.Errorf("stdout = %q, want the main agent's answer", stdout)
+	}
+	requests := llm.recorded()
+	if len(requests) != 4 {
+		t.Fatalf("LLM received %d requests, want 4", len(requests))
+	}
+	system := skillsSystemMessage("apple: Use this skill when the user asks about the on-call rotation.")
+	// The subagent works through its own conversation with the tools...
+	assertMessages(t, requests[1], userMessage(instructions))
+	assertMessages(t, requests[2],
+		userMessage(instructions),
+		assistantMessage("", readFile),
+		toolMessage("call_2", "blueberry\n"),
+	)
+	// ...of which the main conversation only sees the outcome.
+	assertMessages(t, requests[3],
+		system,
+		userMessage(prompt),
+		assistantMessage("", useSkill),
+		toolMessage("call_1", "Skill apple ran in a separate context and returned: blueberry"),
+	)
+}
+
+func TestRunHandsUserInvokedForkedSkillToSubagent(t *testing.T) {
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, skillsDir, "apple", skillFile), lines(
+		"---",
+		"name: apple",
+		"description: Use this skill when the user asks about the on-call rotation.",
+		"context: fork",
+		"---",
+		"",
+		"Respond with exactly this text: blueberry-$ARGUMENTS",
+	))
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "grape", "Formats source code.",
+		"Add this exact line to your response: cherry-$ARGUMENTS")
+	t.Chdir(project)
+	system := skillsSystemMessage(
+		"apple: Use this skill when the user asks about the on-call rotation.",
+		"grape: Formats source code.",
+	)
+	tests := []struct {
+		prompt       string
+		wantMessages []map[string]any
+	}{
+		// The forked skill opens the prompt: a subagent handles it, alone.
+		{"/apple", []map[string]any{userMessage("Respond with exactly this text: blueberry-")}},
+		{"/apple 4127", []map[string]any{userMessage("Respond with exactly this text: blueberry-4127")}},
+		{"/apple /grape 4127", []map[string]any{userMessage("Respond with exactly this text: blueberry-/grape 4127")}},
+		// The forked skill comes after another one: it ends the stacking run.
+		{"/grape /apple 4127", []map[string]any{system, userMessage("Add this exact line to your response: cherry-/apple 4127")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.prompt, func(t *testing.T) {
+			llm := newFakeLLM(t, assistantText("the answer"))
+
+			stdout, stderr, code := runCLI(t, llm, "-p", tt.prompt)
+
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout != "the answer" {
+				t.Errorf("stdout = %q, want %q", stdout, "the answer")
+			}
+			assertMessages(t, llm.onlyRequest(), tt.wantMessages...)
+		})
+	}
+}
+
+func TestRunReportsSubagentFailureToTheMainAgent(t *testing.T) {
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, skillsDir, "apple", skillFile), lines(
+		"---",
+		"name: apple",
+		"description: Use this skill when the user asks about the on-call rotation.",
+		"context: fork",
+		"---",
+		"",
+		"Respond with exactly one word: blueberry",
+	))
+	t.Chdir(project)
+	useSkill := toolCall{id: "call_1", name: "Skill", arguments: `{"name": "apple"}`}
+	llm := newFakeLLM(t,
+		assistantToolCalls(useSkill),           // main agent
+		httpError(http.StatusUnauthorized),     // subagent
+		assistantText("I could not find out."), // main agent
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", "Who is on call?")
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "I could not find out." {
+		t.Errorf("stdout = %q, want the main agent's answer", stdout)
+	}
+	requests := llm.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("LLM received %d requests, want 3", len(requests))
+	}
+	messages := requests[2].Body["messages"].([]any)
+	result, _ := messages[len(messages)-1].(map[string]any)["content"].(string)
+	if !strings.HasPrefix(result, `Error: skill "apple" failed in its subagent: `) || !strings.Contains(result, "401") {
+		t.Errorf("tool result = %q, want it to report the failure of the subagent", result)
 	}
 }
 

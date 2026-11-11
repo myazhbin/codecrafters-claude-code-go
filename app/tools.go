@@ -34,13 +34,19 @@ func (t Tool) Spec() openai.ChatCompletionToolUnionParam {
 // Toolbox is a set of tools offered to the model.
 type Toolbox []Tool
 
-// newToolbox returns the tools this program offers to the model: the tools
-// that act on the project and, if the project has skills, the tool that loads
-// them.
-func newToolbox(skills []Skill) Toolbox {
-	toolbox := Toolbox{readTool, writeTool, bashTool}
+// baseToolbox returns the tools that act on the project. They are all that a
+// subagent gets.
+func baseToolbox() Toolbox {
+	return Toolbox{readTool, writeTool, bashTool}
+}
+
+// newToolbox returns the tools offered to the main agent: the tools that act
+// on the project and, if the project has skills, the tool that uses them,
+// which runs the skills that ask for a subagent with fork.
+func newToolbox(skills []Skill, fork forkFunc) Toolbox {
+	toolbox := baseToolbox()
 	if len(skills) > 0 {
-		toolbox = append(toolbox, newSkillTool(skills))
+		toolbox = append(toolbox, newSkillTool(skills, fork))
 	}
 	return toolbox
 }

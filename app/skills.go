@@ -37,13 +37,24 @@ type Skill struct {
 	// Bundled reports whether the folder holds files besides the SKILL.md,
 	// such as scripts that the instructions tell the model to run.
 	Bundled bool
+	// Fork reports whether the skill asks to be handled by a subagent: its
+	// instructions then stay out of the main conversation, which only gets
+	// the subagent's answer.
+	Fork bool
 }
 
 // skillMetadata is the part of a SKILL.md frontmatter that the program uses.
 type skillMetadata struct {
 	Name        string `yaml:"name"`
 	Description string `yaml:"description"`
+	// Context is "fork" for a skill that runs in a subagent.
+	Context string `yaml:"context"`
 }
+
+// forkFunc runs a prompt in a subagent, that is in a conversation of its own
+// that starts with that prompt and nothing else, and returns the subagent's
+// answer.
+type forkFunc func(ctx context.Context, prompt string) (string, error)
 
 // loadSkills discovers the skills kept in dir: every folder in it that holds a
 // SKILL.md file. A missing dir simply means that there are no skills.
@@ -98,6 +109,7 @@ func parseSkill(dir, document string) Skill {
 		Description: strings.Join(strings.Fields(metadata.Description), " "),
 		Body:        strings.TrimSpace(body),
 		Dir:         dir,
+		Fork:        strings.TrimSpace(metadata.Context) == "fork",
 	}
 	if skill.Name == "" {
 		skill.Name = filepath.Base(dir)
@@ -197,6 +209,10 @@ func findSkill(skills []Skill, name string) (Skill, bool) {
 // "/apple /grape arguments". Every leading word that names a skill invokes
 // it; the first word that does not, and everything after it, are the
 // arguments, which all the invoked skills share.
+//
+// A skill that runs in a subagent is never stacked with others: it is invoked
+// alone when it opens the prompt, and it ends the run of invocations like any
+// other word when it comes later.
 func invokedSkills(prompt string, skills []Skill) (invoked []Skill, arguments string) {
 	rest := strings.TrimSpace(prompt)
 	for {
@@ -207,6 +223,12 @@ func invokedSkills(prompt string, skills []Skill) (invoked []Skill, arguments st
 		}
 		skill, found := findSkill(skills, name)
 		if !found {
+			break
+		}
+		if skill.Fork {
+			if len(invoked) == 0 {
+				return []Skill{skill}, remainder
+			}
 			break
 		}
 		invoked = append(invoked, skill)
@@ -230,19 +252,22 @@ func cutWord(text string) (word, rest string) {
 // arguments filled in: the model gets them instead of the raw prompt. Any
 // other prompt is the one message, including a prompt that merely starts with
 // a slash, such as a question about a file path.
-func expandSlashCommands(prompt string, skills []Skill) ([]string, error) {
+//
+// fork reports that the prompt invokes a skill that runs in a subagent, which
+// is then the one to handle the messages.
+func expandSlashCommands(prompt string, skills []Skill) (messages []string, fork bool, err error) {
 	invoked, arguments := invokedSkills(prompt, skills)
 	if len(invoked) == 0 {
-		return []string{prompt}, nil
+		return []string{prompt}, false, nil
 	}
-	messages := make([]string, len(invoked))
+	messages = make([]string, len(invoked))
 	for i, skill := range invoked {
 		if skill.Body == "" {
-			return nil, fmt.Errorf("skill %q has no instructions", skill.Name)
+			return nil, false, fmt.Errorf("skill %q has no instructions", skill.Name)
 		}
 		messages[i] = skill.Prompt(arguments)
 	}
-	return messages, nil
+	return messages, invoked[0].Fork, nil
 }
 
 // Prompt returns the message that hands the skill's instructions to the model,
@@ -327,8 +352,10 @@ func skillsPrompt(skills []Skill) string {
 }
 
 // newSkillTool returns the tool that lets the model use one of the skills on
-// its own initiative: the tool hands the skill's instructions to the model.
-func newSkillTool(skills []Skill) Tool {
+// its own initiative. The tool hands the skill's instructions to the model,
+// unless the skill runs in a subagent: the instructions then go to fork, and
+// the model gets the subagent's answer.
+func newSkillTool(skills []Skill, fork forkFunc) Tool {
 	return Tool{
 		Name:        "Skill",
 		Description: "Load a skill's instructions into the conversation",
@@ -346,7 +373,7 @@ func newSkillTool(skills []Skill) Tool {
 				},
 			},
 		},
-		Run: func(_ context.Context, arguments string) (string, error) {
+		Run: func(ctx context.Context, arguments string) (string, error) {
 			var args struct {
 				Name string `json:"name"`
 				Args string `json:"args"`
@@ -366,7 +393,15 @@ func newSkillTool(skills []Skill) Tool {
 			if skill.Body == "" {
 				return "", fmt.Errorf("skill %q has no instructions", skill.Name)
 			}
-			return skill.Prompt(strings.TrimSpace(args.Args)), nil
+			prompt := skill.Prompt(strings.TrimSpace(args.Args))
+			if !skill.Fork {
+				return prompt, nil
+			}
+			answer, err := fork(ctx, prompt)
+			if err != nil {
+				return "", fmt.Errorf("skill %q failed in its subagent: %w", skill.Name, err)
+			}
+			return fmt.Sprintf("Skill %s ran in a separate context and returned: %s", skill.Name, answer), nil
 		},
 	}
 }

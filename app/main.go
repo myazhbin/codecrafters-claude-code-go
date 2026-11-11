@@ -59,17 +59,28 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if err != nil {
 		fmt.Fprintf(stderr, "warning: skills are unavailable: %v\n", err)
 	}
-	prompts, err := expandSlashCommands(*prompt, skills)
+	prompts, fork, err := expandSlashCommands(*prompt, skills)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
 
+	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL))
+	// A subagent is the same loop run over a conversation of its own: it knows
+	// nothing of the skills, and can only act on the project.
+	subagent := &Agent{client: client, toolbox: baseToolbox(), log: stderr}
 	agent := &Agent{
-		client:  openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL)),
-		toolbox: newToolbox(skills),
-		system:  skillsPrompt(skills),
-		log:     stderr,
+		client: client,
+		toolbox: newToolbox(skills, func(ctx context.Context, prompt string) (string, error) {
+			return subagent.Run(ctx, []string{prompt})
+		}),
+		system: skillsPrompt(skills),
+		log:    stderr,
+	}
+	if fork {
+		// The user invoked a skill that runs in a subagent: its answer is the
+		// program's.
+		agent = subagent
 	}
 	answer, err := agent.Run(ctx, prompts)
 	if err != nil {
