@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -169,22 +171,27 @@ func findSkill(skills []Skill, name string) (Skill, bool) {
 	return Skill{}, false
 }
 
-// slashCommandName returns the name that a prompt of the form "/name ..."
-// invokes. ok is false for a prompt that does not start with a slash.
-func slashCommandName(prompt string) (name string, ok bool) {
-	fields := strings.Fields(prompt)
-	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
-		return "", false
+// parseSlashCommand splits a prompt of the form "/name arguments" into the
+// name, its first word, and the arguments, everything after it. ok is false
+// for a prompt that does not start with a slash.
+func parseSlashCommand(prompt string) (name, arguments string, ok bool) {
+	command, isCommand := strings.CutPrefix(strings.TrimSpace(prompt), "/")
+	if !isCommand {
+		return "", "", false
 	}
-	return strings.TrimPrefix(fields[0], "/"), true
+	if end := strings.IndexFunc(command, unicode.IsSpace); end >= 0 {
+		return command[:end], strings.TrimSpace(command[end:]), true
+	}
+	return command, "", true
 }
 
-// expandSlashCommand turns a prompt that invokes a skill, "/name", into the
-// instructions of that skill, which the model gets instead of the raw prompt.
-// Any other prompt is returned as is, including one that merely starts with a
-// slash, such as a question about a file path.
+// expandSlashCommand turns a prompt that invokes a skill, "/name arguments",
+// into the instructions of that skill with the arguments filled in, which the
+// model gets instead of the raw prompt. Any other prompt is returned as is,
+// including one that merely starts with a slash, such as a question about a
+// file path.
 func expandSlashCommand(prompt string, skills []Skill) (string, error) {
-	name, ok := slashCommandName(prompt)
+	name, arguments, ok := parseSlashCommand(prompt)
 	if !ok {
 		return prompt, nil
 	}
@@ -195,7 +202,47 @@ func expandSlashCommand(prompt string, skills []Skill) (string, error) {
 	if skill.Body == "" {
 		return "", fmt.Errorf("skill %q has no instructions", name)
 	}
-	return skill.Body, nil
+	return substituteArguments(skill.Body, arguments), nil
+}
+
+// argumentPlaceholder matches the placeholders of a skill's body: $ARGUMENTS,
+// $ARGUMENTS[N] and its shorthand $N.
+var argumentPlaceholder = regexp.MustCompile(`\$ARGUMENTS\[(\d+)\]|\$ARGUMENTS|\$(\d+)`)
+
+// substituteArguments fills the placeholders of a skill's body with the
+// arguments the skill was invoked with: $ARGUMENTS stands for all of them, as
+// typed, while $ARGUMENTS[N] and $N stand for the N-th whitespace-separated
+// one, counting from zero, and for nothing if there are fewer arguments.
+//
+// Arguments given to a body without any placeholder are appended to it, so
+// that the model still gets to see them.
+func substituteArguments(body, arguments string) string {
+	words := strings.Fields(arguments)
+	word := func(position string) string {
+		i, err := strconv.Atoi(position)
+		if err != nil || i >= len(words) {
+			return ""
+		}
+		return words[i]
+	}
+
+	substituted := false
+	body = argumentPlaceholder.ReplaceAllStringFunc(body, func(placeholder string) string {
+		substituted = true
+		groups := argumentPlaceholder.FindStringSubmatch(placeholder)
+		switch {
+		case groups[1] != "":
+			return word(groups[1])
+		case groups[2] != "":
+			return word(groups[2])
+		default:
+			return arguments
+		}
+	})
+	if !substituted && arguments != "" {
+		body += "\n\nARGUMENTS: " + arguments
+	}
+	return body
 }
 
 // skillsPrompt returns the system prompt that advertises the skills to the

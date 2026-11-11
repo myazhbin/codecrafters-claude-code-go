@@ -463,31 +463,182 @@ func TestRunKeepsSystemPromptAtTheFrontOfTheConversation(t *testing.T) {
 	)
 }
 
-func TestSlashCommandName(t *testing.T) {
+func TestParseSlashCommand(t *testing.T) {
 	tests := []struct {
-		prompt   string
-		wantName string
-		wantOK   bool
+		prompt        string
+		wantName      string
+		wantArguments string
+		wantOK        bool
 	}{
-		{"/apple", "apple", true},
-		{"/apple-pie_2", "apple-pie_2", true},
-		{"  /apple\n", "apple", true},
-		{"/apple and then some more words", "apple", true},
-		{"/apple\nsecond line", "apple", true},
-		{"/etc/hosts is what kind of file?", "etc/hosts", true},
-		{"/", "", true},
-		{"apple", "", false},
-		{"deploy /apple", "", false},
-		{"", "", false},
-		{"   ", "", false},
+		{"/apple", "apple", "", true},
+		{"/apple-pie_2", "apple-pie_2", "", true},
+		{"  /apple\n", "apple", "", true},
+		{"/apple 4127", "apple", "4127", true},
+		{"/apple staging eu-west", "apple", "staging eu-west", true},
+		{"/apple   staging   eu-west  ", "apple", "staging   eu-west", true},
+		{"/apple\tstaging", "apple", "staging", true},
+		{"/apple\nsecond line", "apple", "second line", true},
+		{"/etc/hosts is what kind of file?", "etc/hosts", "is what kind of file?", true},
+		{"/", "", "", true},
+		{"/ apple", "", "apple", true},
+		{"apple", "", "", false},
+		{"deploy /apple", "", "", false},
+		{"", "", "", false},
+		{"   ", "", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.prompt, func(t *testing.T) {
-			name, ok := slashCommandName(tt.prompt)
+			name, arguments, ok := parseSlashCommand(tt.prompt)
 
-			if name != tt.wantName || ok != tt.wantOK {
-				t.Errorf("slashCommandName(%q) = %q, %v; want %q, %v", tt.prompt, name, ok, tt.wantName, tt.wantOK)
+			if name != tt.wantName || arguments != tt.wantArguments || ok != tt.wantOK {
+				t.Errorf("parseSlashCommand(%q) = %q, %q, %v; want %q, %q, %v",
+					tt.prompt, name, arguments, ok, tt.wantName, tt.wantArguments, tt.wantOK)
 			}
+		})
+	}
+}
+
+func TestSubstituteArguments(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		arguments string
+		want      string
+	}{
+		{
+			name:      "all arguments",
+			body:      "Respond with exactly: $ARGUMENTS",
+			arguments: "4127",
+			want:      "Respond with exactly: 4127",
+		},
+		{
+			name:      "positional shorthands in the order the body asks for",
+			body:      "Respond with exactly: $1 $0",
+			arguments: "mango pear",
+			want:      "Respond with exactly: pear mango",
+		},
+		{
+			name:      "indexed arguments",
+			body:      "Deploy $ARGUMENTS[1] to $ARGUMENTS[0].",
+			arguments: "staging api",
+			want:      "Deploy api to staging.",
+		},
+		{
+			name:      "every kind of placeholder in one body",
+			body:      "Deploy to $0 in region $1. Full request was: $ARGUMENTS",
+			arguments: "staging eu-west",
+			want:      "Deploy to staging in region eu-west. Full request was: staging eu-west",
+		},
+		{
+			name:      "repeated placeholders",
+			body:      "$0, $0 and $ARGUMENTS[0] again; $ARGUMENTS and $ARGUMENTS",
+			arguments: "echo",
+			want:      "echo, echo and echo again; echo and echo",
+		},
+		{
+			name:      "placeholders next to other text",
+			body:      "($0)[$1]$0$1.$ARGUMENTS!",
+			arguments: "a b",
+			want:      "(a)[b]ab.a b!",
+		},
+		{
+			name:      "no arguments",
+			body:      "Deploy to '$0' ($ARGUMENTS) [$ARGUMENTS[1]].",
+			arguments: "",
+			want:      "Deploy to '' () [].",
+		},
+		{
+			name:      "fewer arguments than placeholders",
+			body:      "first=$0 second=$1 third=$ARGUMENTS[2]",
+			arguments: "only",
+			want:      "first=only second= third=",
+		},
+		{
+			name:      "positions of several digits",
+			body:      "$10 $ARGUMENTS[11] $1",
+			arguments: "a b c d e f g h i j k l",
+			want:      "k l b",
+		},
+		{
+			name:      "position too large to be a number",
+			body:      "[$99999999999999999999999]",
+			arguments: "a b",
+			want:      "[]",
+		},
+		{
+			name:      "arguments are kept as typed",
+			body:      "all=<$ARGUMENTS> second=<$1>",
+			arguments: "one   two\tthree",
+			want:      "all=<one   two\tthree> second=<two>",
+		},
+		{
+			name:      "arguments that look like placeholders are not expanded again",
+			body:      "$0 | $ARGUMENTS",
+			arguments: "$1 $ARGUMENTS secret",
+			want:      "$1 | $1 $ARGUMENTS secret",
+		},
+		{
+			name:      "an index that is not a number is not a position",
+			body:      "$ARGUMENTS[x] $ARGUMENTS[-1]",
+			arguments: "a b",
+			want:      "a b[x] a b[-1]",
+		},
+		{
+			name:      "body without placeholders gets the arguments appended",
+			body:      "Deploy the service.",
+			arguments: "staging eu-west",
+			want:      "Deploy the service.\n\nARGUMENTS: staging eu-west",
+		},
+		{
+			name:      "body without placeholders and no arguments",
+			body:      "Deploy the service for $USER, it costs $ 5.",
+			arguments: "",
+			want:      "Deploy the service for $USER, it costs $ 5.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := substituteArguments(tt.body, tt.arguments); got != tt.want {
+				t.Errorf("substituteArguments(%q, %q) = %q\nwant %q", tt.body, tt.arguments, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunPassesArgumentsToSkill(t *testing.T) {
+	project := t.TempDir()
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "apple", "Echoes its arguments.",
+		"Respond with exactly this text and nothing else: $ARGUMENTS")
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "grape", "Swaps its two arguments.",
+		"Respond with exactly this text and nothing else: $1 $0")
+	t.Chdir(project)
+	tests := []struct {
+		prompt   string
+		wantTask string
+	}{
+		{"/apple 4127", "Respond with exactly this text and nothing else: 4127"},
+		{"/grape mango pear", "Respond with exactly this text and nothing else: pear mango"},
+		{"/apple staging eu-west", "Respond with exactly this text and nothing else: staging eu-west"},
+		{"/apple", "Respond with exactly this text and nothing else: "},
+		{"/grape", "Respond with exactly this text and nothing else:  "},
+		{"/grape mango", "Respond with exactly this text and nothing else:  mango"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.prompt, func(t *testing.T) {
+			llm := newFakeLLM(t, assistantText("ok"))
+
+			_, stderr, code := runCLI(t, llm, "-p", tt.prompt)
+
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			assertMessages(t, llm.onlyRequest(),
+				systemMessage("You have access to the following skills:\n"+
+					"\n"+
+					"- apple: Echoes its arguments.\n"+
+					"- grape: Swaps its two arguments."),
+				userMessage(tt.wantTask),
+			)
 		})
 	}
 }
