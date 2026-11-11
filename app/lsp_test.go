@@ -182,8 +182,9 @@ func locationOf(path string, startLine, startCharacter, endLine, endCharacter in
 	}
 }
 
-// The invoice project: checkout.py calls pricing.total under another name,
-// while preview.py has an unrelated function of the same name.
+// The invoice project: checkout.py calls pricing.total under another name and
+// reports.py under its own, while preview.py has an unrelated function of the
+// same name.
 const (
 	checkoutSource = "from pricing import total as invoice_total\n" +
 		"\n" +
@@ -192,6 +193,11 @@ const (
 		"    return invoice_total(items)\n"
 	pricingSource = "def total(items):\n" +
 		"    return sum(item.price * item.quantity for item in items)\n"
+	reportsSource = "from pricing import total\n" +
+		"\n" +
+		"\n" +
+		"def report(orders, refunds):\n" +
+		"    return total(orders) - total(refunds)\n"
 	previewSource = "def total(lines):\n" +
 		"    return len(lines)\n"
 )
@@ -203,6 +209,7 @@ func newInvoiceProject(t *testing.T) string {
 	project := t.TempDir()
 	writeFile(t, filepath.Join(project, "checkout.py"), checkoutSource)
 	writeFile(t, filepath.Join(project, "pricing.py"), pricingSource)
+	writeFile(t, filepath.Join(project, "reports.py"), reportsSource)
 	writeFile(t, filepath.Join(project, "preview.py"), previewSource)
 	t.Chdir(project)
 	return project
@@ -224,13 +231,13 @@ const lspToolSpec = `{
 	"type": "function",
 	"function": {
 		"name": "LSP",
-		"description": "Returns the file, line, and character where a symbol is defined.",
+		"description": "Asks the language server about the symbol at a position of a file. goToDefinition returns the file, line, and character where the symbol is defined. findReferences returns the file, line, and character of every reference to the symbol, such as the calls of a function, including through aliases.",
 		"parameters": {
 			"type": "object",
 			"properties": {
 				"operation": {
 					"type": "string",
-					"enum": ["goToDefinition"]
+					"enum": ["goToDefinition", "findReferences"]
 				},
 				"filePath": {
 					"type": "string",
@@ -529,6 +536,244 @@ func TestLSPToolDescribesDefinitions(t *testing.T) {
 	}
 }
 
+// invoiceTotalReferences returns what the server knows to refer to
+// pricing.total in the invoice project: its declaration, the imports and the
+// calls, whatever the name they use.
+func invoiceTotalReferences(project string) []any {
+	return []any{
+		locationOf(filepath.Join(project, "pricing.py"), 0, 4, 0, 9),
+		locationOf(filepath.Join(project, "checkout.py"), 0, 20, 0, 25),
+		locationOf(filepath.Join(project, "checkout.py"), 4, 11, 4, 24),
+		locationOf(filepath.Join(project, "reports.py"), 0, 20, 0, 25),
+		locationOf(filepath.Join(project, "reports.py"), 4, 11, 4, 16),
+		locationOf(filepath.Join(project, "reports.py"), 4, 27, 4, 32),
+	}
+}
+
+func TestRunFindsReferencesWithLSP(t *testing.T) {
+	const prompt = "Use LSP findReferences on pricing.py at line 1, character 5, and list the callers " +
+		"that a change to pricing.total's return type would affect. Don't change any code. " +
+		"Preserve the returned locations; preview.total and comments are unrelated."
+	project := newInvoiceProject(t)
+	lsp := newFakeLSP(t)
+	lsp.script("textDocument/references", invoiceTotalReferences(project))
+	findReferences := toolCall{
+		id:        "call_lsp_1",
+		name:      "LSP",
+		arguments: `{"operation": "findReferences", "filePath": "pricing.py", "line": 1, "character": 5}`,
+	}
+	llm := newFakeLLM(t,
+		assistantToolCalls(findReferences),
+		assistantText("checkout.py and reports.py are affected."),
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", prompt)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "checkout.py and reports.py are affected." {
+		t.Errorf("stdout = %q, want the model's list of callers", stdout)
+	}
+
+	// The server gets the queried document, then the request about the symbol
+	// at the zero-based position, declaration included.
+	pricingURI := fileURI(filepath.Join(project, "pricing.py"))
+	wantCalls := []lspCall{
+		{Action: "configuration"},
+		{Action: "notify", Method: "textDocument/didOpen", Params: map[string]any{
+			"textDocument": map[string]any{
+				"uri":        pricingURI,
+				"languageId": "python",
+				"version":    float64(1),
+				"text":       pricingSource,
+			},
+		}},
+		{Action: "request", Method: "textDocument/references", Params: map[string]any{
+			"textDocument": map[string]any{"uri": pricingURI},
+			"position":     map[string]any{"line": float64(0), "character": float64(4)},
+			"context":      map[string]any{"includeDeclaration": true},
+		}},
+	}
+	if got := lsp.received(); !reflect.DeepEqual(got, wantCalls) {
+		t.Errorf("LSP transport received %s\nwant %s", toJSON(t, got), toJSON(t, wantCalls))
+	}
+
+	// Every location reaches the model, with its file and one-based position.
+	requests := llm.recorded()
+	if len(requests) != 2 {
+		t.Fatalf("LLM received %d requests, want 2", len(requests))
+	}
+	assertMessages(t, requests[1],
+		userMessage(prompt),
+		assistantMessage("", findReferences),
+		toolMessage("call_lsp_1", strings.Join([]string{
+			"Found 6 references across 3 files:",
+			"",
+			"pricing.py:",
+			"  Line 1:5",
+			"",
+			"checkout.py:",
+			"  Line 1:21",
+			"  Line 5:12",
+			"",
+			"reports.py:",
+			"  Line 1:21",
+			"  Line 5:12",
+			"  Line 5:28",
+		}, "\n")),
+	)
+	wantSpec := decodeJSON(t, lspToolSpec)
+	for i, request := range requests {
+		if got := advertisedTools(t, request)["LSP"]; !reflect.DeepEqual(got, wantSpec) {
+			t.Errorf("request #%d: LSP tool = %s\nwant %s", i+1, toJSON(t, got), toJSON(t, wantSpec))
+		}
+	}
+}
+
+func TestRunReportsThatNoReferencesWereFound(t *testing.T) {
+	newInvoiceProject(t)
+	lsp := newFakeLSP(t)
+	lsp.script("textDocument/references", []any{})
+	findReferences := toolCall{
+		id:        "call_lsp_1",
+		name:      "LSP",
+		arguments: `{"operation": "findReferences", "filePath": "pricing.py", "line": 1, "character": 5}`,
+	}
+	llm := newFakeLLM(t,
+		assistantToolCalls(findReferences),
+		assistantText("Nothing calls it."),
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", "Who calls pricing.total?")
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "Nothing calls it." {
+		t.Errorf("stdout = %q, want the model's answer", stdout)
+	}
+	assertMessages(t, llm.recorded()[1],
+		userMessage("Who calls pricing.total?"),
+		assistantMessage("", findReferences),
+		toolMessage("call_lsp_1", "No references found"),
+	)
+}
+
+func TestLSPToolOpensTheDocumentItIsAskedAbout(t *testing.T) {
+	project := newInvoiceProject(t)
+	lsp := newFakeLSP(t)
+	lsp.script("textDocument/definition", locationOf(filepath.Join(project, "pricing.py"), 0, 4, 0, 9))
+	lsp.script("textDocument/references", invoiceTotalReferences(project))
+	tool := newConnectedLSPTool(t)
+
+	// Looking a definition up from checkout.py does not send pricing.py to
+	// the server, even though that is where the definition is.
+	for _, arguments := range []string{
+		`{"operation": "goToDefinition", "filePath": "checkout.py", "line": 5, "character": 12}`,
+		`{"operation": "findReferences", "filePath": "pricing.py", "line": 1, "character": 5}`,
+		`{"operation": "findReferences", "filePath": "checkout.py", "line": 5, "character": 12}`,
+	} {
+		if _, err := tool.Run(context.Background(), arguments); err != nil {
+			t.Fatalf("LSP(%s) returned an error: %v", arguments, err)
+		}
+	}
+
+	var got []string
+	for _, call := range lsp.received()[1:] {
+		textDocument, _ := call.Params["textDocument"].(map[string]any)
+		uri, _ := textDocument["uri"].(string)
+		got = append(got, call.Method+" "+filepath.Base(pathFromURI(uri)))
+	}
+	want := []string{
+		"textDocument/didOpen checkout.py",
+		"textDocument/definition checkout.py",
+		"textDocument/didOpen pricing.py",
+		"textDocument/references pricing.py",
+		"textDocument/references checkout.py",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("LSP transport received %q\nwant %q", got, want)
+	}
+}
+
+func TestLSPToolDescribesReferences(t *testing.T) {
+	project := newInvoiceProject(t)
+	outside := writeTempFile(t, "library.py", "from pricing import total\n")
+	tests := []struct {
+		name   string
+		result any
+		want   string
+	}{
+		{
+			name:   "one reference",
+			result: []any{locationOf(filepath.Join(project, "pricing.py"), 0, 4, 0, 9)},
+			want: "Found 1 reference across 1 file:\n" +
+				"\n" +
+				"pricing.py:\n" +
+				"  Line 1:5",
+		},
+		{
+			name: "several references in one file stay separate",
+			result: []any{
+				locationOf(filepath.Join(project, "reports.py"), 4, 11, 4, 16),
+				locationOf(filepath.Join(project, "reports.py"), 4, 27, 4, 32),
+			},
+			want: "Found 2 references across 1 file:\n" +
+				"\n" +
+				"reports.py:\n" +
+				"  Line 5:12\n" +
+				"  Line 5:28",
+		},
+		{
+			name: "files in the order of the server, each listed once",
+			result: []any{
+				locationOf(filepath.Join(project, "reports.py"), 4, 11, 4, 16),
+				locationOf(filepath.Join(project, "billing", "tax.py"), 9, 0, 9, 5),
+				locationOf(filepath.Join(project, "reports.py"), 0, 20, 0, 25),
+				locationOf(outside, 0, 20, 0, 25),
+			},
+			want: "Found 4 references across 3 files:\n" +
+				"\n" +
+				"reports.py:\n" +
+				"  Line 5:12\n" +
+				"  Line 1:21\n" +
+				"\n" +
+				filepath.Join("billing", "tax.py") + ":\n" +
+				"  Line 10:1\n" +
+				"\n" +
+				outside + ":\n" +
+				"  Line 1:21",
+		},
+		{
+			name:   "no references",
+			result: []any{},
+			want:   "No references found",
+		},
+		{
+			name:   "no answer",
+			result: nil,
+			want:   "No references found",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lsp := newFakeLSP(t)
+			lsp.script("textDocument/references", tt.result)
+			tool := newConnectedLSPTool(t)
+
+			got, err := tool.Run(context.Background(), `{"operation": "findReferences", "filePath": "pricing.py", "line": 1, "character": 5}`)
+
+			if err != nil {
+				t.Fatalf("LSP returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("LSP = %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLSPToolRejectsBadCalls(t *testing.T) {
 	project := newInvoiceProject(t)
 	writeFile(t, filepath.Join(project, "notes.txt"), "not code\n")
@@ -584,16 +829,23 @@ func TestLSPToolRejectsBadCalls(t *testing.T) {
 			wantErr:   "no language server is configured for files like notes.txt",
 		},
 		{
-			name:          "request refused by the server",
+			name:          "definition request refused by the server",
 			arguments:     `{"operation": "goToDefinition", "filePath": "checkout.py", "line": 5, "character": 12}`,
 			wantErr:       "scripted failure of textDocument/definition",
 			wantExchanges: []string{"textDocument/didOpen", "textDocument/definition"},
+		},
+		{
+			name:          "references request refused by the server",
+			arguments:     `{"operation": "findReferences", "filePath": "pricing.py", "line": 1, "character": 5}`,
+			wantErr:       "scripted failure of textDocument/references",
+			wantExchanges: []string{"textDocument/didOpen", "textDocument/references"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			lsp := newFakeLSP(t)
 			lsp.failNext("textDocument/definition")
+			lsp.failNext("textDocument/references")
 			tool := newConnectedLSPTool(t)
 
 			got, err := tool.Run(context.Background(), tt.arguments)

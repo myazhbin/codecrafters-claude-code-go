@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -104,17 +105,32 @@ func (s *languageServer) open(path string) (uri string, err error) {
 // definition returns where the symbol at the given position of the file at
 // path is defined.
 func (s *languageServer) definition(path string, position lspPosition) ([]lspLocation, error) {
+	return s.locate("textDocument/definition", path, position, nil)
+}
+
+// references returns every place that refers to the symbol at the given
+// position of the file at path, its declaration included.
+func (s *languageServer) references(path string, position lspPosition) ([]lspLocation, error) {
+	return s.locate("textDocument/references", path, position, map[string]any{
+		"context": map[string]any{"includeDeclaration": true},
+	})
+}
+
+// locate sends the server a request about the symbol at the given position of
+// the file at path, after making sure that the server has the file, and
+// returns the locations that answer it. options holds the parameters that the
+// request takes on top of the document and the position, if any.
+func (s *languageServer) locate(method, path string, position lspPosition, options map[string]any) ([]lspLocation, error) {
 	uri, err := s.open(path)
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.client.Call("request", lspMessage{
-		Method: "textDocument/definition",
-		Params: map[string]any{
-			"textDocument": map[string]any{"uri": uri},
-			"position":     position,
-		},
-	})
+	params := map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position":     position,
+	}
+	maps.Copy(params, options)
+	result, err := s.client.Call("request", lspMessage{Method: method, Params: params})
 	if err != nil {
 		return nil, err
 	}
@@ -147,14 +163,17 @@ func decodeLocations(result json.RawMessage) ([]lspLocation, error) {
 // about the code of the project.
 func newLSPTool(server *languageServer) Tool {
 	return Tool{
-		Name:        "LSP",
-		Description: "Returns the file, line, and character where a symbol is defined.",
+		Name: "LSP",
+		Description: "Asks the language server about the symbol at a position of a file. " +
+			"goToDefinition returns the file, line, and character where the symbol is defined. " +
+			"findReferences returns the file, line, and character of every reference to the symbol, " +
+			"such as the calls of a function, including through aliases.",
 		Parameters: openai.FunctionParameters{
 			"type": "object",
 			"properties": map[string]any{
 				"operation": map[string]any{
 					"type": "string",
-					"enum": []string{"goToDefinition"},
+					"enum": []string{"goToDefinition", "findReferences"},
 				},
 				"filePath": map[string]any{
 					"type":        "string",
@@ -183,8 +202,9 @@ func newLSPTool(server *languageServer) Tool {
 			if err := decodeArguments(arguments, &args); err != nil {
 				return "", err
 			}
+			operation, supported := lspOperations[args.Operation]
 			switch {
-			case args.Operation != "goToDefinition":
+			case !supported:
 				return "", fmt.Errorf("unsupported operation %q", args.Operation)
 			case args.FilePath == "":
 				return "", errors.New("filePath is required")
@@ -198,28 +218,87 @@ func newLSPTool(server *languageServer) Tool {
 
 			// The model counts lines and characters from one, like an editor,
 			// and the protocol from zero.
-			locations, err := server.definition(path, lspPosition{Line: args.Line - 1, Character: args.Character - 1})
+			locations, err := operation.ask(server, path, lspPosition{Line: args.Line - 1, Character: args.Character - 1})
 			if err != nil {
 				return "", err
 			}
-			if len(locations) == 0 {
-				return "No definition found", nil
-			}
-			lines := make([]string, len(locations))
-			for i, location := range locations {
-				lines[i] = "Defined in " + describeLocation(location)
-			}
-			return strings.Join(lines, "\n"), nil
+			return operation.describe(locations), nil
 		},
 	}
 }
 
-// describeLocation renders where a location starts as path:line:character, the
-// way the model refers to code: the path is relative to the working directory
-// and the position is counted from one.
-func describeLocation(location lspLocation) string {
+// lspOperations holds what the LSP tool can do for the model, by the name of
+// the operation: how it asks the server, and how it reports the locations
+// that the server answers with.
+var lspOperations = map[string]struct {
+	ask      func(server *languageServer, path string, position lspPosition) ([]lspLocation, error)
+	describe func(locations []lspLocation) string
+}{
+	"goToDefinition": {(*languageServer).definition, describeDefinitions},
+	"findReferences": {(*languageServer).references, describeReferences},
+}
+
+// describeDefinitions reports where a symbol is defined: one line for each
+// definition, of the form "Defined in pricing.py:1:5".
+func describeDefinitions(locations []lspLocation) string {
+	if len(locations) == 0 {
+		return "No definition found"
+	}
+	lines := make([]string, len(locations))
+	for i, location := range locations {
+		file, line, character := startOf(location)
+		lines[i] = fmt.Sprintf("Defined in %s:%d:%d", file, line, character)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// describeReferences reports the references to a symbol, each of them on a
+// line of its own under the file it is in:
+//
+//	Found 3 references across 2 files:
+//
+//	pricing.py:
+//	  Line 1:5
+//
+//	checkout.py:
+//	  Line 1:21
+//	  Line 5:12
+func describeReferences(locations []lspLocation) string {
+	if len(locations) == 0 {
+		return "No references found"
+	}
+	var files []string // in the order the server first mentions them
+	positions := map[string][]string{}
+	for _, location := range locations {
+		file, line, character := startOf(location)
+		if _, seen := positions[file]; !seen {
+			files = append(files, file)
+		}
+		positions[file] = append(positions[file], fmt.Sprintf("  Line %d:%d", line, character))
+	}
+
+	sections := make([]string, len(files))
+	for i, file := range files {
+		sections[i] = file + ":\n" + strings.Join(positions[file], "\n")
+	}
+	return fmt.Sprintf("Found %s across %s:\n\n%s",
+		count(len(locations), "reference"), count(len(files), "file"), strings.Join(sections, "\n\n"))
+}
+
+// count renders a number of things, as in "1 file" or "3 files".
+func count(n int, thing string) string {
+	if n == 1 {
+		return "1 " + thing
+	}
+	return fmt.Sprintf("%d %ss", n, thing)
+}
+
+// startOf returns where a location starts, the way the model refers to code:
+// the path of the file is relative to the working directory, and the line and
+// the character are counted from one.
+func startOf(location lspLocation) (file string, line, character int) {
 	start := location.Range.Start
-	return fmt.Sprintf("%s:%d:%d", displayPath(pathFromURI(location.URI)), start.Line+1, start.Character+1)
+	return displayPath(pathFromURI(location.URI)), start.Line + 1, start.Character + 1
 }
 
 // fileURI returns the URI that identifies the file at an absolute path to the
@@ -246,13 +325,22 @@ func displayPath(path string) string {
 	if err != nil {
 		return path
 	}
+	if relative, inside := relativeTo(directory, path); inside {
+		return relative
+	}
 	// The server and the agent may know the same file through different
 	// symbolic links.
-	relative, err := filepath.Rel(resolveSymlinks(directory), resolveSymlinks(path))
-	if err != nil || !filepath.IsLocal(relative) {
-		return path
+	if relative, inside := relativeTo(resolveSymlinks(directory), resolveSymlinks(path)); inside {
+		return relative
 	}
-	return relative
+	return path
+}
+
+// relativeTo returns path relative to directory. inside reports whether path
+// is in directory at all.
+func relativeTo(directory, path string) (relative string, inside bool) {
+	relative, err := filepath.Rel(directory, path)
+	return relative, err == nil && filepath.IsLocal(relative)
 }
 
 // resolveSymlinks returns path with its symbolic links followed, or path
