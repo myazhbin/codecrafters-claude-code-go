@@ -250,15 +250,16 @@ func expandSlashCommands(prompt string, skills []Skill) ([]string, error) {
 //
 // Instructions refer to the files bundled with their skill, such as scripts,
 // by paths relative to the skill's folder. So the message for a skill that
-// bundles files starts by telling the model where that folder is. A skill made
-// of instructions alone is spared that: the folder holds nothing of use to the
-// model, and naming it only invites the model to go and look.
+// bundles files starts by telling the model where that folder is, and that
+// the skill is loaded already, lest the model asks for it with the Skill tool.
+// A skill made of instructions alone is spared that: the folder holds nothing
+// of use to the model, and naming it only invites the model to go and look.
 func (s Skill) Prompt(arguments string) string {
 	instructions := substituteArguments(s.Body, arguments)
 	if !s.Bundled {
 		return instructions
 	}
-	return fmt.Sprintf("Skill: %s (located at %s)\n"+
+	return fmt.Sprintf("Skill %q is loaded from %s.\n"+
 		"Paths in the instructions below are relative to that folder.\n"+
 		"\n"+
 		"%s", s.Name, s.Dir, instructions)

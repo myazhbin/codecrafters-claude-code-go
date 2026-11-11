@@ -912,7 +912,7 @@ func TestSkillPrompt(t *testing.T) {
 		{
 			name:  "skill that bundles files: the message says where its folder is",
 			skill: Skill{Name: "apple", Body: body, Dir: ".claude/skills/apple", Bundled: true},
-			want: "Skill: apple (located at .claude/skills/apple)\n" +
+			want: "Skill \"apple\" is loaded from .claude/skills/apple.\n" +
 				"Paths in the instructions below are relative to that folder.\n" +
 				"\n" +
 				instructions,
@@ -1024,7 +1024,7 @@ func TestSkillToolReturnsSkillInstructions(t *testing.T) {
 		{
 			name:      "skill that bundles files",
 			arguments: `{"name": "melon"}`,
-			want: "Skill: melon (located at .claude/skills/melon)\n" +
+			want: "Skill \"melon\" is loaded from .claude/skills/melon.\n" +
 				"Paths in the instructions below are relative to that folder.\n" +
 				"\n" +
 				"Run `scripts/checksum.sh`.",
@@ -1176,7 +1176,7 @@ func skillsSystemMessage(skills ...string) map[string]any {
 // skillMessage is the user message that hands the instructions of an invoked
 // skill of the project to the model, when that skill bundles files.
 func skillMessage(name, instructions string) map[string]any {
-	return userMessage("Skill: " + name + " (located at .claude/skills/" + name + ")\n" +
+	return userMessage("Skill \"" + name + "\" is loaded from .claude/skills/" + name + ".\n" +
 		"Paths in the instructions below are relative to that folder.\n" +
 		"\n" +
 		instructions)
