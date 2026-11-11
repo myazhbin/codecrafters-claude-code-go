@@ -22,10 +22,17 @@ import (
 // told about the project's files.
 type languageServer struct {
 	client *LSPClient
+	// log receives what goes wrong behind the scenes.
+	log io.Writer
 	// documents holds the files sent to the server, by URI. The server needs
 	// a file before it can answer about it, rejects a file that is opened
 	// twice, and only learns that a file has changed when it is told so.
 	documents map[string]*document
+	// cursor marks how far the queue of the server's notifications was read.
+	cursor json.RawMessage
+	// reported holds the issues of the latest report that the model was told
+	// about for each file, by URI, so that it is only told about new ones.
+	reported map[string][]diagnostic
 }
 
 // document is a file as the language server knows it.
@@ -51,7 +58,13 @@ func connectLSP(log io.Writer) *languageServer {
 		return nil
 	}
 	fmt.Fprintln(log, "LSP client connected")
-	return &languageServer{client: client, documents: map[string]*document{}}
+	return &languageServer{
+		client:    client,
+		log:       log,
+		documents: map[string]*document{},
+		cursor:    json.RawMessage("0"),
+		reported:  map[string][]diagnostic{},
+	}
 }
 
 // The types below are the parts of the Language Server Protocol that the
@@ -78,6 +91,26 @@ type lspRange struct {
 type lspLocation struct {
 	URI   string   `json:"uri"`
 	Range lspRange `json:"range"`
+}
+
+// diagnostic is an issue that the server found in a document, such as a type
+// error.
+type diagnostic struct {
+	Range lspRange `json:"range"`
+	// Severity is 1 for an error, 2 for a warning, 3 for an information and
+	// 4 for a hint.
+	Severity int    `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// diagnosticReport is the content of a textDocument/publishDiagnostics
+// notification: all the issues of a document.
+type diagnosticReport struct {
+	URI string `json:"uri"`
+	// Version is the version of the document that the report is about, when
+	// the server tells.
+	Version     *int         `json:"version"`
+	Diagnostics []diagnostic `json:"diagnostics"`
 }
 
 // open sends the file at path to the server, unless the server has it
@@ -175,6 +208,115 @@ func (s *languageServer) didChange(document *document, text string) error {
 	}
 	document.version, document.text = version, text
 	return nil
+}
+
+// newDiagnostics returns the issues that the server has reported since it was
+// last asked and that the model has not been told about yet, in the form that
+// is added to a tool result, or "" if there is none:
+//
+//	<new-diagnostics>The following new diagnostic issues were detected:
+//
+//	checkout.py:
+//	  [Line 5:12] Type Price is not assignable to return type int</new-diagnostics>
+//
+// The server analyzes the project in the background, so an edit to a file can
+// bring up issues some time later, and in other files.
+func (s *languageServer) newDiagnostics() string {
+	// The latest report of a file replaces the previous ones.
+	var files []string // in the order of their first report
+	latest := map[string][]diagnostic{}
+	for _, report := range s.readReports() {
+		if _, seen := latest[report.URI]; !seen {
+			files = append(files, report.URI)
+		}
+		latest[report.URI] = report.Diagnostics
+	}
+
+	var sections []string
+	for _, uri := range files {
+		var issues []string
+		for _, issue := range latest[uri] {
+			if !slices.Contains(s.reported[uri], issue) {
+				issues = append(issues, "  "+issue.String())
+			}
+		}
+		s.reported[uri] = latest[uri]
+		if len(issues) > 0 {
+			sections = append(sections, displayPath(pathFromURI(uri))+":\n"+strings.Join(issues, "\n"))
+		}
+	}
+	if len(sections) == 0 {
+		return ""
+	}
+	return "<new-diagnostics>The following new diagnostic issues were detected:\n\n" +
+		strings.Join(sections, "\n\n") + "</new-diagnostics>"
+}
+
+// readReports reads the notifications that the server has queued since the
+// last read, without waiting for more, and returns the diagnostic reports
+// among them that are current: a report made for another version of a file
+// than the one the server was last sent is about code that is gone.
+func (s *languageServer) readReports() []diagnosticReport {
+	response, err := s.client.Call("notifications", map[string]any{"after": s.cursor, "timeoutMs": 0})
+	if err != nil {
+		fmt.Fprintf(s.log, "warning: cannot read the notifications of the language server: %v\n", err)
+		return nil
+	}
+	var batch struct {
+		Cursor        json.RawMessage `json:"cursor"`
+		Notifications []struct {
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		} `json:"notifications"`
+	}
+	if err := json.Unmarshal(response, &batch); err != nil {
+		fmt.Fprintf(s.log, "warning: cannot read the notifications of the language server: %v\n", err)
+		return nil
+	}
+	if len(batch.Cursor) > 0 {
+		s.cursor = batch.Cursor
+	}
+
+	var reports []diagnosticReport
+	for _, notification := range batch.Notifications {
+		if notification.Method != "textDocument/publishDiagnostics" {
+			continue
+		}
+		var report diagnosticReport
+		if err := json.Unmarshal(notification.Params, &report); err != nil {
+			fmt.Fprintf(s.log, "warning: cannot read a diagnostic report of the language server: %v\n", err)
+			continue
+		}
+		// The server may not write the URI of a file the way the agent does.
+		if path := pathFromURI(report.URI); path != report.URI {
+			report.URI = fileURI(path)
+		}
+		if report.Version != nil {
+			document := s.documents[report.URI]
+			if document == nil || document.version != *report.Version {
+				continue
+			}
+		}
+		reports = append(reports, report)
+	}
+	return reports
+}
+
+// String renders the issue the way the model is told about it, as in
+// "[Line 5:12] Type Price is not assignable to return type int": where it
+// starts, counted from one, and what it is, with its severity when it is less
+// than an error.
+func (d diagnostic) String() string {
+	description := fmt.Sprintf("[Line %d:%d] %s", d.Range.Start.Line+1, d.Range.Start.Character+1, d.Message)
+	switch d.Severity {
+	case 2:
+		description += " (warning)"
+	case 3:
+		description += " (information)"
+	case 4:
+		description += " (hint)"
+	}
+	return description
 }
 
 // trackWrites returns the Write tool extended to tell the server about every
@@ -287,7 +429,9 @@ func newLSPTool(server *languageServer) Tool {
 			"goToDefinition returns the file, line, and character where the symbol is defined. " +
 			"findReferences returns the file, line, and character of every reference to the symbol, " +
 			"such as the calls of a function, including through aliases. " +
-			"Save your edits with the Write tool: the language server then answers about the new code.",
+			"Save your edits with the Write tool: the language server then answers about the new code, " +
+			"and reports the issues it finds in it, such as type errors, in any file. " +
+			"These reports come in a <new-diagnostics> block at the end of a later tool result: use them to repair your edits.",
 		Parameters: openai.FunctionParameters{
 			"type": "object",
 			"properties": map[string]any{

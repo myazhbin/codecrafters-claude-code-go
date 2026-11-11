@@ -21,6 +21,9 @@ type fakeLLM struct {
 	mu       sync.Mutex
 	replies  []llmReply
 	requests []llmRequest
+	// onRequest, if set, is called with the number of each request, counted
+	// from one, once the request is recorded and before it is answered.
+	onRequest func(number int)
 }
 
 // llmReply is one scripted response of the fake LLM.
@@ -123,10 +126,15 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 		Body:          body,
 	})
 	var reply *llmReply
-	if n := len(f.requests); n <= len(f.replies) {
-		reply = &f.replies[n-1]
+	number := len(f.requests)
+	if number <= len(f.replies) {
+		reply = &f.replies[number-1]
 	}
+	onRequest := f.onRequest
 	f.mu.Unlock()
+	if onRequest != nil {
+		onRequest(number)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if reply == nil {

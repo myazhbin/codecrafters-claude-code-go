@@ -67,7 +67,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 	// The language server, if any, is connected before the first request to
 	// the model, and for the whole run.
-	tools := baseToolbox(connectLSP(stderr))
+	lsp := connectLSP(stderr)
+	tools := baseToolbox(lsp)
 
 	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL))
 	// A subagent is the same loop run over a conversation of its own: it knows
@@ -80,6 +81,12 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		}),
 		system: skillsPrompt(skills),
 		log:    stderr,
+	}
+	if lsp != nil {
+		// Whichever agent is at work hears about the issues that the language
+		// server finds in the code.
+		agent.feedback = lsp.newDiagnostics
+		subagent.feedback = lsp.newDiagnostics
 	}
 	if fork {
 		// The user invoked a skill that runs in a subagent: its answer is the

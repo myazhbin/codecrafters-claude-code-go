@@ -17,6 +17,11 @@ type Agent struct {
 	toolbox Toolbox
 	// system is the system prompt that opens the conversation, if any.
 	system string
+	// feedback, if set, is asked before each request to the model for what
+	// has turned up since the previous one, such as the issues found in the
+	// code that the model edited. The model gets it with its latest tool
+	// result.
+	feedback func() string
 	// log receives progress information for humans. It is never stdout, which
 	// is reserved for the final answer.
 	log io.Writer
@@ -35,6 +40,7 @@ func (a *Agent) Run(ctx context.Context, prompts []string) (string, error) {
 	}
 
 	for {
+		a.deliverFeedback(messages)
 		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 			Model:    model,
 			Messages: messages,
@@ -57,6 +63,27 @@ func (a *Agent) Run(ctx context.Context, prompts []string) (string, error) {
 			messages = append(messages, openai.ToolMessage(a.execute(ctx, call), call.ID))
 		}
 	}
+}
+
+// deliverFeedback adds the feedback that has turned up since the last request
+// to the latest tool result of the conversation. Feedback is only asked for
+// once there is a tool result to carry it.
+func (a *Agent) deliverFeedback(messages []openai.ChatCompletionMessageParamUnion) {
+	if a.feedback == nil {
+		return
+	}
+	result := messages[len(messages)-1].OfTool
+	if result == nil {
+		return
+	}
+	feedback := a.feedback()
+	if feedback == "" {
+		return
+	}
+	if content := result.Content.OfString.Value; content != "" {
+		feedback = content + "\n\n" + feedback
+	}
+	result.Content.OfString = openai.String(feedback)
 }
 
 // execute runs one tool call and returns the content of the tool message that

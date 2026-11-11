@@ -40,9 +40,18 @@ type fakeLSP struct {
 	failures map[string]int
 	// documents holds the server's copy of the documents it was sent, by URI.
 	documents map[string]fakeDocument
-	calls     []lspCall
+	// queue holds the notifications that the server has sent so far. The
+	// client reads it with a cursor: the number of notifications it has read.
+	queue []any
+	// calls holds the calls received, but for the reads of the queue, which
+	// are in polls: when they happen is up to the agent's loop.
+	calls []lspCall
+	polls []map[string]any
 	// onCall, if set, is called for every action received.
 	onCall func(action string)
+	// onDocument, if set, is called with the path of each document that the
+	// server takes, opened or changed, and with the server's new copy of it.
+	onDocument func(path string, document fakeDocument)
 }
 
 // fakeDocument is the fake server's copy of a document.
@@ -107,12 +116,25 @@ func (f *fakeLSP) handle(w http.ResponseWriter, r *http.Request) {
 	call.Params, _ = payload["params"].(map[string]any)
 
 	f.mu.Lock()
-	f.calls = append(f.calls, call)
-	status, response := f.answer(call)
-	onCall := f.onCall
+	var status int
+	var response any
+	if action == "notifications" {
+		f.polls = append(f.polls, payload)
+		status, response = f.read(payload)
+	} else {
+		f.calls = append(f.calls, call)
+		status, response = f.answer(call)
+	}
+	onCall, onDocument := f.onCall, f.onDocument
+	textDocument, _ := call.Params["textDocument"].(map[string]any)
+	uri, _ := textDocument["uri"].(string)
+	document := f.documents[uri]
 	f.mu.Unlock()
 	if onCall != nil {
 		onCall(action)
+	}
+	if onDocument != nil && action == "notify" && status == http.StatusOK {
+		onDocument(pathFromURI(uri), document)
 	}
 
 	if status != http.StatusOK {
@@ -177,6 +199,69 @@ func (f *fakeLSP) answer(call lspCall) (status int, response any) {
 	default:
 		return http.StatusNotFound, "unexpected " + call.Action + " " + call.Method
 	}
+}
+
+// read answers a read of the queue of notifications: those that the client
+// has not read yet, and the cursor for its next read.
+func (f *fakeLSP) read(payload map[string]any) (status int, response any) {
+	if f.failures["notifications"] > 0 {
+		f.failures["notifications"]--
+		return http.StatusInternalServerError, "scripted failure of notifications"
+	}
+	after, isNumber := payload["after"].(float64)
+	if !isNumber || int(after) > len(f.queue) {
+		return http.StatusBadRequest, "want the cursor of the previous read after \"after\""
+	}
+	if timeout, isNumber := payload["timeoutMs"].(float64); !isNumber || timeout != 0 {
+		return http.StatusBadRequest, "want a read that does not wait, with \"timeoutMs\": 0"
+	}
+	return http.StatusOK, map[string]any{
+		"cursor":        len(f.queue),
+		"notifications": append([]any{}, f.queue[int(after):]...),
+	}
+}
+
+// publish queues a notification from the server.
+func (f *fakeLSP) publish(method string, params map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queue = append(f.queue, map[string]any{"method": method, "params": params})
+}
+
+// publishDiagnostics queues the server's report of the issues of the file at
+// path. version is the version of the document that the report is about; a
+// report with version 0 says nothing of the version.
+func (f *fakeLSP) publishDiagnostics(path string, version int, issues ...map[string]any) {
+	params := map[string]any{"uri": fileURI(path), "diagnostics": append([]map[string]any{}, issues...)}
+	if version != 0 {
+		params["version"] = version
+	}
+	f.publish("textDocument/publishDiagnostics", params)
+}
+
+// issueAt builds an issue as the server reports it, with a range counted from
+// zero. Severity 1 is an error.
+func issueAt(startLine, startCharacter, endLine, endCharacter, severity int, message string) map[string]any {
+	return map[string]any{
+		"range": map[string]any{
+			"start": map[string]any{"line": startLine, "character": startCharacter},
+			"end":   map[string]any{"line": endLine, "character": endCharacter},
+		},
+		"severity": severity,
+		"message":  message,
+	}
+}
+
+// cursors returns the cursor that each read of the queue was made with.
+func (f *fakeLSP) cursors() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cursors := make([]int, len(f.polls))
+	for i, poll := range f.polls {
+		after, _ := poll["after"].(float64)
+		cursors[i] = int(after)
+	}
+	return cursors
 }
 
 // copyOf returns the server's copy of the file at path, if it was sent it.
@@ -320,7 +405,7 @@ const lspToolSpec = `{
 	"type": "function",
 	"function": {
 		"name": "LSP",
-		"description": "Asks the language server about the symbol at a position of a file. goToDefinition returns the file, line, and character where the symbol is defined. findReferences returns the file, line, and character of every reference to the symbol, such as the calls of a function, including through aliases. Save your edits with the Write tool: the language server then answers about the new code.",
+		"description": "Asks the language server about the symbol at a position of a file. goToDefinition returns the file, line, and character where the symbol is defined. findReferences returns the file, line, and character of every reference to the symbol, such as the calls of a function, including through aliases. Save your edits with the Write tool: the language server then answers about the new code, and reports the issues it finds in it, such as type errors, in any file. These reports come in a <new-diagnostics> block at the end of a later tool result: use them to repair your edits.",
 		"parameters": {
 			"type": "object",
 			"properties": {
