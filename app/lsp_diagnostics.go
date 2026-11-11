@@ -27,9 +27,15 @@ type diagnosticReport struct {
 	Diagnostics []diagnostic `json:"diagnostics"`
 }
 
-// newDiagnostics returns the issues that the server has reported since it was
-// last asked and that the model has not been told about yet, in the form that
-// is added to a tool result, or "" if there is none:
+// fileIssue is an issue in the file that a URI identifies.
+type fileIssue struct {
+	uri   string
+	issue diagnostic
+}
+
+// newDiagnostics returns the issues that the server has reported and that the
+// model has not been told about yet, in the form that is added to a tool
+// result, or "" if there is none:
 //
 //	<new-diagnostics>The following new diagnostic issues were detected:
 //
@@ -39,34 +45,51 @@ type diagnosticReport struct {
 // The server analyzes the project in the background, so an edit to a file can
 // bring up issues some time later, and in other files.
 func (s *languageServer) newDiagnostics() string {
-	// The latest report of a file replaces the previous ones.
-	var files []string // in the order of their first report
-	latest := map[string][]diagnostic{}
-	for _, report := range s.readReports() {
-		if _, seen := latest[report.URI]; !seen {
-			files = append(files, report.URI)
-		}
-		latest[report.URI] = report.Diagnostics
+	s.collectDiagnostics()
+	if len(s.pending) == 0 {
+		return ""
 	}
 
-	var sections []string
-	for _, uri := range files {
-		var issues []string
-		for _, issue := range latest[uri] {
-			if !slices.Contains(s.reported[uri], issue) {
-				issues = append(issues, "  "+issue.String())
-			}
+	var files []string // in the order their issues came up
+	issues := map[string][]string{}
+	for _, news := range s.pending {
+		file := displayPath(pathFromURI(news.uri))
+		if _, seen := issues[file]; !seen {
+			files = append(files, file)
 		}
-		s.reported[uri] = latest[uri]
-		if len(issues) > 0 {
-			sections = append(sections, displayPath(pathFromURI(uri))+":\n"+strings.Join(issues, "\n"))
-		}
+		issues[file] = append(issues[file], "  "+news.issue.String())
 	}
-	if len(sections) == 0 {
-		return ""
+	s.pending = nil
+
+	sections := make([]string, len(files))
+	for i, file := range files {
+		sections[i] = file + ":\n" + strings.Join(issues[file], "\n")
 	}
 	return "<new-diagnostics>The following new diagnostic issues were detected:\n\n" +
 		strings.Join(sections, "\n\n") + "</new-diagnostics>"
+}
+
+// collectDiagnostics takes in the reports that the server has made since the
+// last time, and sets aside the issues that are news to the model: those that
+// the previous report of their file did not have. A report replaces the
+// previous one of its file as what the model is taken to know, so that an
+// issue that goes away and comes back is news again.
+//
+// A report is weighed against the versions of the files at the time it is
+// read. So the reports are collected before each change that is sent to the
+// server, and not just before each request to the model: after the change, a
+// report that was right about a file when the server made it would look out
+// of date.
+func (s *languageServer) collectDiagnostics() {
+	for _, report := range s.readReports() {
+		for _, issue := range report.Diagnostics {
+			news := fileIssue{uri: report.URI, issue: issue}
+			if !slices.Contains(s.reported[report.URI], issue) && !slices.Contains(s.pending, news) {
+				s.pending = append(s.pending, news)
+			}
+		}
+		s.reported[report.URI] = report.Diagnostics
+	}
 }
 
 // readReports reads the notifications that the server has queued since the

@@ -41,8 +41,10 @@ type fakeLSP struct {
 	// documents holds the server's copy of the documents it was sent, by URI.
 	documents map[string]fakeDocument
 	// queue holds the notifications that the server has sent so far. The
-	// client reads it with a cursor: the number of notifications it has read.
-	queue []any
+	// client reads it with a cursor: the number of notifications it has read,
+	// which the server gave it with its previous read.
+	queue  []any
+	cursor int
 	// calls holds the calls received, but for the reads of the queue, which
 	// are in polls: when they happen is up to the agent's loop.
 	calls []lspCall
@@ -209,12 +211,15 @@ func (f *fakeLSP) read(payload map[string]any) (status int, response any) {
 		return http.StatusInternalServerError, "scripted failure of notifications"
 	}
 	after, isNumber := payload["after"].(float64)
-	if !isNumber || int(after) > len(f.queue) {
+	if !isNumber || int(after) != f.cursor {
+		f.t.Errorf("fakeLSP: the queue is read after %v, want after the cursor of the previous read, %d", payload["after"], f.cursor)
 		return http.StatusBadRequest, "want the cursor of the previous read after \"after\""
 	}
 	if timeout, isNumber := payload["timeoutMs"].(float64); !isNumber || timeout != 0 {
+		f.t.Errorf("fakeLSP: the queue is read with timeoutMs %v, want a read that does not wait", payload["timeoutMs"])
 		return http.StatusBadRequest, "want a read that does not wait, with \"timeoutMs\": 0"
 	}
+	f.cursor = len(f.queue)
 	return http.StatusOK, map[string]any{
 		"cursor":        len(f.queue),
 		"notifications": append([]any{}, f.queue[int(after):]...),

@@ -26,9 +26,11 @@ type languageServer struct {
 	documents map[string]*document
 	// cursor marks how far the queue of the server's notifications was read.
 	cursor json.RawMessage
-	// reported holds the issues of the latest report that the model was told
-	// about for each file, by URI, so that it is only told about new ones.
+	// reported holds the issues of the latest report taken in for each file,
+	// by URI: what the model is taken to know about the file.
 	reported map[string][]diagnostic
+	// pending holds the issues that the model has yet to be told about.
+	pending []fileIssue
 }
 
 // document is a file as the language server knows it.
@@ -149,15 +151,12 @@ func (s *languageServer) handles(path string) bool {
 // didOpen sends the server a file that it does not have yet.
 func (s *languageServer) didOpen(path, text string) error {
 	uri := fileURI(path)
-	_, err := s.client.Call("notify", lspMessage{
-		Method: "textDocument/didOpen",
-		Params: map[string]any{
-			"textDocument": map[string]any{
-				"uri":        uri,
-				"languageId": s.client.ExtensionToLanguage[filepath.Ext(path)],
-				"version":    1,
-				"text":       text,
-			},
+	err := s.notify("textDocument/didOpen", map[string]any{
+		"textDocument": map[string]any{
+			"uri":        uri,
+			"languageId": s.client.ExtensionToLanguage[filepath.Ext(path)],
+			"version":    1,
+			"text":       text,
 		},
 	})
 	if err != nil {
@@ -172,18 +171,24 @@ func (s *languageServer) didOpen(path, text string) error {
 // only becomes the document's once the server has taken the change.
 func (s *languageServer) didChange(document *document, text string) error {
 	version := document.version + 1
-	_, err := s.client.Call("notify", lspMessage{
-		Method: "textDocument/didChange",
-		Params: map[string]any{
-			"textDocument":   map[string]any{"uri": fileURI(document.path), "version": version},
-			"contentChanges": []any{map[string]any{"text": text}},
-		},
+	err := s.notify("textDocument/didChange", map[string]any{
+		"textDocument":   map[string]any{"uri": fileURI(document.path), "version": version},
+		"contentChanges": []any{map[string]any{"text": text}},
 	})
 	if err != nil {
 		return err
 	}
 	document.version, document.text = version, text
 	return nil
+}
+
+// notify sends the server a notification about a document. The reports that
+// the server has made so far are taken in first: they are about the documents
+// as the server has them now, before the notification changes that.
+func (s *languageServer) notify(method string, params map[string]any) error {
+	s.collectDiagnostics()
+	_, err := s.client.Call("notify", lspMessage{Method: method, Params: params})
+	return err
 }
 
 // definition returns where the symbol at the given position of the file at

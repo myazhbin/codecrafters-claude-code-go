@@ -86,11 +86,6 @@ func TestRunAddsNewDiagnosticsToLatestToolResult(t *testing.T) {
 		assistantMessage("", read),
 		toolMessage("call_3", checkoutSource),
 	)
-	// The queue is read before every request that follows a tool result, each
-	// time from where the previous read left it.
-	if got, want := lsp.cursors(), []int{0, 0, 1}; !reflect.DeepEqual(got, want) {
-		t.Errorf("the queue of notifications was read after %v, want %v", got, want)
-	}
 }
 
 func TestRunAddsDiagnosticsThatArriveLaterToLaterToolResult(t *testing.T) {
@@ -164,6 +159,83 @@ func TestRunAddsDiagnosticsToTheLastToolResultOfATurn(t *testing.T) {
 		toolMessage("call_1", fmt.Sprintf("Wrote %d bytes to pricing.py", len(migratedPricingSource))),
 		toolMessage("call_2", brokenCallerReport),
 	)
+}
+
+func TestRunTellsModelAboutIssueThatLaterWriteOfTheSameTurnFixes(t *testing.T) {
+	const prompt = "Change pricing.total to return a Price TypedDict. Fix the type errors your tools report."
+	const fixedCheckoutSource = "from pricing import total as invoice_total\n" +
+		"\n" +
+		"\n" +
+		"def checkout(items):\n" +
+		"    return invoice_total(items)[\"cents\"]\n"
+	project := newInvoiceProject(t)
+	checkout := filepath.Join(project, "checkout.py")
+	lsp := newFakeLSP(t)
+	followCheckoutImport(lsp, project)
+	// The server reports on checkout.py as soon as a change calls for it: the
+	// new pricing.py breaks it, and its own new text repairs it.
+	lsp.onDocument = func(path string, document fakeDocument) {
+		switch filepath.Base(path) {
+		case "pricing.py":
+			if copy, open := lsp.copyOf(checkout); open {
+				lsp.publishDiagnostics(checkout, copy.Version, brokenCaller)
+			}
+		case "checkout.py":
+			lsp.publishDiagnostics(checkout, document.Version)
+		}
+	}
+	lookup := toolCall{id: "call_1", name: "LSP", arguments: goToCheckoutTotal}
+	writePricing := toolCall{id: "call_2", name: "Write", arguments: jsonArgs(t, map[string]any{"file_path": "pricing.py", "content": migratedPricingSource})}
+	writeCheckout := toolCall{id: "call_3", name: "Write", arguments: jsonArgs(t, map[string]any{"file_path": "checkout.py", "content": fixedCheckoutSource})}
+	writeReports := toolCall{id: "call_4", name: "Write", arguments: jsonArgs(t, map[string]any{"file_path": "reports.py", "content": reportsSource})}
+	llm := newFakeLLM(t,
+		assistantToolCalls(lookup),
+		// All the edits come in one turn: the model is not asked anything
+		// between the Write that breaks checkout.py and the one that fixes it.
+		assistantToolCalls(writePricing, writeCheckout, writeReports),
+		assistantText("Migrated."),
+	)
+
+	_, stderr, code := runCLI(t, llm, "-p", prompt)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	requests := llm.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("LLM received %d requests, want 3", len(requests))
+	}
+	// The report on the broken checkout.py was right when the server made it.
+	// It reaches the model, although checkout.py has changed by the time the
+	// model is next asked.
+	assertMessages(t, requests[2],
+		userMessage(prompt),
+		assistantMessage("", lookup),
+		toolMessage("call_1", "Defined in pricing.py:1:5"),
+		assistantMessage("", writePricing, writeCheckout, writeReports),
+		toolMessage("call_2", fmt.Sprintf("Wrote %d bytes to pricing.py", len(migratedPricingSource))),
+		toolMessage("call_3", fmt.Sprintf("Wrote %d bytes to checkout.py", len(fixedCheckoutSource))),
+		toolMessage("call_4", fmt.Sprintf("Wrote %d bytes to reports.py", len(reportsSource))+"\n\n"+brokenCallerReport),
+	)
+}
+
+func TestNewDiagnosticsWeighsReportsBeforeTheirDocumentChanges(t *testing.T) {
+	project, lsp, server, _ := newDiagnosticsFixture(t)
+	checkout := filepath.Join(project, "checkout.py")
+	tools := baseToolbox(server)
+	// A report about version 2 of checkout.py is waiting when version 3 is
+	// written. A report about version 2 that comes after that is out of date.
+	lsp.publishDiagnostics(checkout, 2, brokenCaller)
+	if _, err := tools.Call(context.Background(), "Write", jsonArgs(t, map[string]any{"file_path": "checkout.py", "content": checkoutSource})); err != nil {
+		t.Fatalf("Write returned an error: %v", err)
+	}
+	lsp.publishDiagnostics(checkout, 2, issueAt(0, 0, 0, 4, 1, "Stale issue of the previous text"))
+
+	got := server.newDiagnostics()
+
+	if got != brokenCallerReport {
+		t.Errorf("newDiagnostics = %q\nwant %q", got, brokenCallerReport)
+	}
 }
 
 func TestRunDoesNotReadDiagnosticsBeforeThereIsAToolResult(t *testing.T) {
@@ -364,16 +436,18 @@ func TestNewDiagnosticsTellsOnlyAboutIssuesThatAreNew(t *testing.T) {
 			want:    newDiagnosticsBlock("checkout.py:\n" + returnTypeLine + "\n" + unusedImportLine),
 		},
 		{
-			name: "several reports at once: the latest replaces the others",
+			name: "several reports at once: the news of each is told, once",
 			publish: func() {
+				lsp.publishDiagnostics(checkout, 2)
+				lsp.publishDiagnostics(checkout, 2, returnType)
 				lsp.publishDiagnostics(checkout, 2)
 				lsp.publishDiagnostics(checkout, 2, returnType, unusedImport)
 				lsp.publishDiagnostics(checkout, 2, unusedImport)
 			},
-			want: "",
+			want: newDiagnosticsBlock("checkout.py:\n" + returnTypeLine + "\n" + unusedImportLine),
 		},
 		{
-			name:    "issue that was only in a report that got replaced",
+			name:    "the latest of them is what the model is taken to know",
 			publish: func() { lsp.publishDiagnostics(checkout, 2, returnType, unusedImport) },
 			want:    newDiagnosticsBlock("checkout.py:\n" + returnTypeLine),
 		},
@@ -388,8 +462,9 @@ func TestNewDiagnosticsTellsOnlyAboutIssuesThatAreNew(t *testing.T) {
 		}
 	}
 	// Every read of the queue starts where the previous one ended, including
-	// after a read that found nothing.
-	if got, want := lsp.cursors(), []int{0, 1, 1, 2, 3, 4, 5, 6, 7, 10}; !reflect.DeepEqual(got, want) {
+	// after a read that found nothing. The first two reads are those that
+	// came before the document was opened and before it was changed.
+	if got, want := lsp.cursors(), []int{0, 0, 0, 1, 1, 2, 3, 4, 5, 6, 7, 12}; !reflect.DeepEqual(got, want) {
 		t.Errorf("the queue of notifications was read after %v, want %v", got, want)
 	}
 }
@@ -457,7 +532,9 @@ func TestNewDiagnosticsReadsQueueAgainAfterFailedRead(t *testing.T) {
 	if got != brokenCallerReport {
 		t.Errorf("newDiagnostics = %q\nwant %q", got, brokenCallerReport)
 	}
-	if got, want := lsp.cursors(), []int{0, 0}; !reflect.DeepEqual(got, want) {
-		t.Errorf("the queue of notifications was read after %v, want %v", got, want)
+	// The read that failed gave no cursor: the next one starts from the same.
+	cursors := lsp.cursors()
+	if got, want := cursors[len(cursors)-2:], []int{0, 0}; !reflect.DeepEqual(got, want) {
+		t.Errorf("the queue of notifications was last read after %v, want %v", got, want)
 	}
 }
