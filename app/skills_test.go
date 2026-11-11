@@ -463,36 +463,134 @@ func TestRunKeepsSystemPromptAtTheFrontOfTheConversation(t *testing.T) {
 	)
 }
 
-func TestParseSlashCommand(t *testing.T) {
+func TestInvokedSkills(t *testing.T) {
+	skills := []Skill{
+		{Name: "apple", Dir: ".claude/skills/apple"},
+		{Name: "apple-pie_2", Dir: ".claude/skills/apple-pie_2"},
+		{Name: "grape", Dir: ".claude/skills/grape"},
+	}
 	tests := []struct {
 		prompt        string
-		wantName      string
+		wantSkills    []string
 		wantArguments string
-		wantOK        bool
 	}{
-		{"/apple", "apple", "", true},
-		{"/apple-pie_2", "apple-pie_2", "", true},
-		{"  /apple\n", "apple", "", true},
-		{"/apple 4127", "apple", "4127", true},
-		{"/apple staging eu-west", "apple", "staging eu-west", true},
-		{"/apple   staging   eu-west  ", "apple", "staging   eu-west", true},
-		{"/apple\tstaging", "apple", "staging", true},
-		{"/apple\nsecond line", "apple", "second line", true},
-		{"/etc/hosts is what kind of file?", "etc/hosts", "is what kind of file?", true},
-		{"/", "", "", true},
-		{"/ apple", "", "apple", true},
-		{"apple", "", "", false},
-		{"deploy /apple", "", "", false},
-		{"", "", "", false},
-		{"   ", "", "", false},
+		// One skill.
+		{"/apple", []string{"apple"}, ""},
+		{"/apple-pie_2", []string{"apple-pie_2"}, ""},
+		{"  /apple\n", []string{"apple"}, ""},
+		{"/apple 4127", []string{"apple"}, "4127"},
+		{"/apple staging eu-west", []string{"apple"}, "staging eu-west"},
+		{"/apple   staging   eu-west  ", []string{"apple"}, "staging   eu-west"},
+		{"/apple\tstaging", []string{"apple"}, "staging"},
+		{"/apple\nsecond line", []string{"apple"}, "second line"},
+		// Stacked skills: the first word that names no skill starts the arguments.
+		{"/apple /grape 4127", []string{"apple", "grape"}, "4127"},
+		{"/grape /apple 4127", []string{"grape", "apple"}, "4127"},
+		{"/apple /grape", []string{"apple", "grape"}, ""},
+		{" /apple\n/grape\t 4127 ", []string{"apple", "grape"}, "4127"},
+		{"/apple /apple-pie_2 /grape a b", []string{"apple", "apple-pie_2", "grape"}, "a b"},
+		{"/apple /apple twice", []string{"apple", "apple"}, "twice"},
+		{"/apple 4127 /grape", []string{"apple"}, "4127 /grape"},
+		{"/apple /pear 4127", []string{"apple"}, "/pear 4127"},
+		{"/apple / /grape", []string{"apple"}, "/ /grape"},
+		// No skill.
+		{"/pear /apple 4127", nil, "/pear /apple 4127"},
+		{"/etc/hosts is what kind of file?", nil, "/etc/hosts is what kind of file?"},
+		{"/", nil, "/"},
+		{"apple", nil, "apple"},
+		{"deploy /apple", nil, "deploy /apple"},
+		{"", nil, ""},
+		{"   ", nil, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.prompt, func(t *testing.T) {
-			name, arguments, ok := parseSlashCommand(tt.prompt)
+			invoked, arguments := invokedSkills(tt.prompt, skills)
 
-			if name != tt.wantName || arguments != tt.wantArguments || ok != tt.wantOK {
-				t.Errorf("parseSlashCommand(%q) = %q, %q, %v; want %q, %q, %v",
-					tt.prompt, name, arguments, ok, tt.wantName, tt.wantArguments, tt.wantOK)
+			var names []string
+			for _, skill := range invoked {
+				names = append(names, skill.Name)
+			}
+			if !reflect.DeepEqual(names, tt.wantSkills) || arguments != tt.wantArguments {
+				t.Errorf("invokedSkills(%q) = %q, %q; want %q, %q",
+					tt.prompt, names, arguments, tt.wantSkills, tt.wantArguments)
+			}
+		})
+	}
+}
+
+func TestRunStacksSkills(t *testing.T) {
+	project := t.TempDir()
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "apple", "Reports the deploy target for the apple service.",
+		"Add this exact line to your response: blueberry-$ARGUMENTS")
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "grape", "Summarizes recent incidents for the payments team.",
+		"Add this exact line to your response: cherry-$ARGUMENTS")
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "melon", "Rotates credentials for the notification database.",
+		"Add this exact line to your response: papaya-$ARGUMENTS")
+	t.Chdir(project)
+	system := systemMessage("You have access to the following skills:\n" +
+		"\n" +
+		"- apple: Reports the deploy target for the apple service.\n" +
+		"- grape: Summarizes recent incidents for the payments team.\n" +
+		"- melon: Rotates credentials for the notification database.")
+	tests := []struct {
+		prompt       string
+		wantMessages []map[string]any
+	}{
+		{
+			prompt: "/apple /grape 4127",
+			wantMessages: []map[string]any{
+				system,
+				userMessage("Add this exact line to your response: blueberry-4127"),
+				userMessage("Add this exact line to your response: cherry-4127"),
+			},
+		},
+		{
+			prompt: "/grape /apple 4127",
+			wantMessages: []map[string]any{
+				system,
+				userMessage("Add this exact line to your response: cherry-4127"),
+				userMessage("Add this exact line to your response: blueberry-4127"),
+			},
+		},
+		{
+			prompt: "/apple 4127 /grape",
+			wantMessages: []map[string]any{
+				system,
+				userMessage("Add this exact line to your response: blueberry-4127 /grape"),
+			},
+		},
+		{
+			prompt: "/apple /pear 4127",
+			wantMessages: []map[string]any{
+				system,
+				userMessage("Add this exact line to your response: blueberry-/pear 4127"),
+			},
+		},
+		{
+			prompt: "/apple /grape",
+			wantMessages: []map[string]any{
+				system,
+				userMessage("Add this exact line to your response: blueberry-"),
+				userMessage("Add this exact line to your response: cherry-"),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.prompt, func(t *testing.T) {
+			llm := newFakeLLM(t, assistantText("blueberry-4127\ncherry-4127"))
+
+			stdout, stderr, code := runCLI(t, llm, "-p", tt.prompt)
+
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout != "blueberry-4127\ncherry-4127" {
+				t.Errorf("stdout = %q, want the model's answer", stdout)
+			}
+			request := llm.onlyRequest()
+			assertMessages(t, request, tt.wantMessages...)
+			if strings.Contains(toJSON(t, request.Body), "papaya") {
+				t.Errorf("the request discloses the body of a skill that was not invoked: %s", toJSON(t, request.Body))
 			}
 		})
 	}

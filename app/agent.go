@@ -22,15 +22,17 @@ type Agent struct {
 	log io.Writer
 }
 
-// Run executes the agent loop for the prompt and returns the model's final
-// answer.
-func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
+// Run executes the agent loop for the user's prompts, each of which opens the
+// conversation as a message of its own, and returns the model's final answer.
+func (a *Agent) Run(ctx context.Context, prompts []string) (string, error) {
 	tools := a.toolbox.Specs()
 	var messages []openai.ChatCompletionMessageParamUnion
 	if a.system != "" {
 		messages = append(messages, openai.SystemMessage(a.system))
 	}
-	messages = append(messages, openai.UserMessage(prompt))
+	for _, prompt := range prompts {
+		messages = append(messages, openai.UserMessage(prompt))
+	}
 
 	for {
 		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{

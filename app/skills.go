@@ -171,38 +171,56 @@ func findSkill(skills []Skill, name string) (Skill, bool) {
 	return Skill{}, false
 }
 
-// parseSlashCommand splits a prompt of the form "/name arguments" into the
-// name, its first word, and the arguments, everything after it. ok is false
-// for a prompt that does not start with a slash.
-func parseSlashCommand(prompt string) (name, arguments string, ok bool) {
-	command, isCommand := strings.CutPrefix(strings.TrimSpace(prompt), "/")
-	if !isCommand {
-		return "", "", false
+// invokedSkills reads the skill invocations that open a prompt, as in
+// "/apple /grape arguments". Every leading word that names a skill invokes
+// it; the first word that does not, and everything after it, are the
+// arguments, which all the invoked skills share.
+func invokedSkills(prompt string, skills []Skill) (invoked []Skill, arguments string) {
+	rest := strings.TrimSpace(prompt)
+	for {
+		word, remainder := cutWord(rest)
+		name, isCommand := strings.CutPrefix(word, "/")
+		if !isCommand {
+			break
+		}
+		skill, found := findSkill(skills, name)
+		if !found {
+			break
+		}
+		invoked = append(invoked, skill)
+		rest = remainder
 	}
-	if end := strings.IndexFunc(command, unicode.IsSpace); end >= 0 {
-		return command[:end], strings.TrimSpace(command[end:]), true
-	}
-	return command, "", true
+	return invoked, rest
 }
 
-// expandSlashCommand turns a prompt that invokes a skill, "/name arguments",
-// into the instructions of that skill with the arguments filled in, which the
-// model gets instead of the raw prompt. Any other prompt is returned as is,
-// including one that merely starts with a slash, such as a question about a
-// file path.
-func expandSlashCommand(prompt string, skills []Skill) (string, error) {
-	name, arguments, ok := parseSlashCommand(prompt)
-	if !ok {
-		return prompt, nil
+// cutWord splits text into its first word and what follows the whitespace
+// after it.
+func cutWord(text string) (word, rest string) {
+	if end := strings.IndexFunc(text, unicode.IsSpace); end >= 0 {
+		return text[:end], strings.TrimSpace(text[end:])
 	}
-	skill, ok := findSkill(skills, name)
-	if !ok {
-		return prompt, nil
+	return text, ""
+}
+
+// expandSlashCommands turns the user's prompt into the messages that open the
+// conversation. A prompt that invokes skills, "/apple /grape arguments",
+// becomes the instructions of each of those skills, in order, with the
+// arguments filled in: the model gets them instead of the raw prompt. Any
+// other prompt is the one message, including a prompt that merely starts with
+// a slash, such as a question about a file path.
+func expandSlashCommands(prompt string, skills []Skill) ([]string, error) {
+	invoked, arguments := invokedSkills(prompt, skills)
+	if len(invoked) == 0 {
+		return []string{prompt}, nil
 	}
-	if skill.Body == "" {
-		return "", fmt.Errorf("skill %q has no instructions", name)
+	messages := make([]string, len(invoked))
+	for i, skill := range invoked {
+		if skill.Body == "" {
+			return nil, fmt.Errorf("skill %q has no instructions", skill.Name)
+		}
+		messages[i] = substituteArguments(skill.Body, arguments)
 	}
-	return substituteArguments(skill.Body, arguments), nil
+	return messages, nil
 }
 
 // argumentPlaceholder matches the placeholders of a skill's body: $ARGUMENTS,

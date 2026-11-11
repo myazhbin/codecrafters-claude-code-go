@@ -59,7 +59,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	if err != nil {
 		fmt.Fprintf(stderr, "warning: skills are unavailable: %v\n", err)
 	}
-	task, err := expandSlashCommand(*prompt, skills)
+	prompts, err := expandSlashCommands(*prompt, skills)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
@@ -71,7 +71,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		system:  skillsPrompt(skills),
 		log:     stderr,
 	}
-	answer, err := agent.Run(ctx, task)
+	answer, err := agent.Run(ctx, prompts)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
