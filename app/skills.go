@@ -218,9 +218,20 @@ func expandSlashCommands(prompt string, skills []Skill) ([]string, error) {
 		if skill.Body == "" {
 			return nil, fmt.Errorf("skill %q has no instructions", skill.Name)
 		}
-		messages[i] = substituteArguments(skill.Body, arguments)
+		messages[i] = skill.Prompt(arguments)
 	}
 	return messages, nil
+}
+
+// Prompt returns the message that hands the skill's instructions to the model,
+// with the arguments filled in. The instructions refer to the files bundled
+// with the skill, such as its scripts, by paths relative to the skill's
+// folder, so the message starts by telling the model where that folder is.
+func (s Skill) Prompt(arguments string) string {
+	return fmt.Sprintf("Skill: %s (located at %s)\n"+
+		"Paths in the instructions below are relative to that folder.\n"+
+		"\n"+
+		"%s", s.Name, s.Dir, substituteArguments(s.Body, arguments))
 }
 
 // argumentPlaceholder matches the placeholders of a skill's body: $ARGUMENTS,
