@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -24,6 +25,9 @@ const (
 type Skill struct {
 	Name        string
 	Description string
+	// Body holds the skill's instructions: the SKILL.md without its
+	// frontmatter. It reaches the model only when the skill is used.
+	Body string
 	// Dir is the skill's folder.
 	Dir string
 }
@@ -61,13 +65,14 @@ func loadSkills(dir string) ([]Skill, error) {
 // The folder's name stands in for a name missing from the frontmatter: the
 // two are required to match anyway.
 func parseSkill(dir, document string) Skill {
-	frontmatter, _ := splitFrontmatter(document)
+	frontmatter, body := splitFrontmatter(document)
 	metadata := parseSkillMetadata(frontmatter)
 
 	skill := Skill{
 		Name: strings.TrimSpace(metadata.Name),
 		// A description may span several lines: keep the listing one per skill.
 		Description: strings.Join(strings.Fields(metadata.Description), " "),
+		Body:        strings.TrimSpace(body),
 		Dir:         dir,
 	}
 	if skill.Name == "" {
@@ -146,6 +151,51 @@ func isQuoted(value string) bool {
 	}
 	first, last := value[0], value[len(value)-1]
 	return first == last && (first == '"' || first == '\'')
+}
+
+// findSkill returns the skill that goes by name: the name of its folder or,
+// failing that, the name given in its frontmatter.
+func findSkill(skills []Skill, name string) (Skill, bool) {
+	for _, skill := range skills {
+		if filepath.Base(skill.Dir) == name {
+			return skill, true
+		}
+	}
+	for _, skill := range skills {
+		if skill.Name == name {
+			return skill, true
+		}
+	}
+	return Skill{}, false
+}
+
+// slashCommandName returns the name that a prompt of the form "/name ..."
+// invokes. ok is false for a prompt that does not start with a slash.
+func slashCommandName(prompt string) (name string, ok bool) {
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return "", false
+	}
+	return strings.TrimPrefix(fields[0], "/"), true
+}
+
+// expandSlashCommand turns a prompt that invokes a skill, "/name", into the
+// instructions of that skill, which the model gets instead of the raw prompt.
+// Any other prompt is returned as is, including one that merely starts with a
+// slash, such as a question about a file path.
+func expandSlashCommand(prompt string, skills []Skill) (string, error) {
+	name, ok := slashCommandName(prompt)
+	if !ok {
+		return prompt, nil
+	}
+	skill, ok := findSkill(skills, name)
+	if !ok {
+		return prompt, nil
+	}
+	if skill.Body == "" {
+		return "", fmt.Errorf("skill %q has no instructions", name)
+	}
+	return skill.Body, nil
 }
 
 // skillsPrompt returns the system prompt that advertises the skills to the

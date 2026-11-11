@@ -25,7 +25,32 @@ func TestParseSkill(t *testing.T) {
 				"",
 				"Run the deploy script and report the version that was deployed.",
 			),
-			want: Skill{Name: "apple", Description: "Deploys the apple service to production.", Dir: dir},
+			want: Skill{
+				Name:        "apple",
+				Description: "Deploys the apple service to production.",
+				Body:        "Run the deploy script and report the version that was deployed.",
+				Dir:         dir,
+			},
+		},
+		{
+			name: "body of several paragraphs",
+			document: lines(
+				"---",
+				"name: apple",
+				"description: Reports the deploy target for the apple service.",
+				"---",
+				"",
+				"Respond with exactly one word: blueberry",
+				"",
+				"Do not add any other text, punctuation, or formatting.",
+				"",
+			),
+			want: Skill{
+				Name:        "apple",
+				Description: "Reports the deploy target for the apple service.",
+				Body:        "Respond with exactly one word: blueberry\n\nDo not add any other text, punctuation, or formatting.",
+				Dir:         dir,
+			},
 		},
 		{
 			name: "quoted values",
@@ -101,7 +126,7 @@ func TestParseSkill(t *testing.T) {
 				"---",
 				"Body.",
 			), "\n", "\r\n"),
-			want: Skill{Name: "apple", Description: "Deploys the apple service.", Dir: dir},
+			want: Skill{Name: "apple", Description: "Deploys the apple service.", Body: "Body.", Dir: dir},
 		},
 		{
 			name: "byte order mark",
@@ -125,7 +150,12 @@ func TestParseSkill(t *testing.T) {
 				"description: not part of the frontmatter",
 				"---",
 			),
-			want: Skill{Name: "apple", Description: "Deploys the apple service.", Dir: dir},
+			want: Skill{
+				Name:        "apple",
+				Description: "Deploys the apple service.",
+				Body:        "Step one.\n---\ndescription: not part of the frontmatter\n---",
+				Dir:         dir,
+			},
 		},
 		{
 			name: "unquoted colon in the description",
@@ -178,17 +208,17 @@ func TestParseSkill(t *testing.T) {
 		{
 			name:     "empty frontmatter",
 			document: lines("---", "---", "Body."),
-			want:     Skill{Name: "apple", Dir: dir},
+			want:     Skill{Name: "apple", Body: "Body.", Dir: dir},
 		},
 		{
-			name:     "no frontmatter",
+			name:     "no frontmatter: the whole document is the body",
 			document: lines("# Apple", "", "name: not-a-frontmatter"),
-			want:     Skill{Name: "apple", Dir: dir},
+			want:     Skill{Name: "apple", Body: "# Apple\n\nname: not-a-frontmatter", Dir: dir},
 		},
 		{
 			name:     "frontmatter that is never closed",
 			document: lines("---", "name: pear", "description: Never closed."),
-			want:     Skill{Name: "apple", Dir: dir},
+			want:     Skill{Name: "apple", Body: "---\nname: pear\ndescription: Never closed.", Dir: dir},
 		},
 		{
 			name:     "frontmatter that is not YAML at all",
@@ -282,9 +312,24 @@ func TestLoadSkillsFindsEverySkillFolder(t *testing.T) {
 		t.Fatalf("loadSkills returned an error: %v", err)
 	}
 	want := []Skill{
-		{Name: "apple", Description: "Deploys the apple service to production.", Dir: filepath.Join(dir, "apple")},
-		{Name: "banana", Description: "Peels bananas.", Dir: filepath.Join(dir, "banana")},
-		{Name: "grape", Description: "Runs the grape test suite and reports failures.", Dir: filepath.Join(dir, "grape")},
+		{
+			Name:        "apple",
+			Description: "Deploys the apple service to production.",
+			Body:        "Instructions of the apple skill.",
+			Dir:         filepath.Join(dir, "apple"),
+		},
+		{
+			Name:        "banana",
+			Description: "Peels bananas.",
+			Body:        "Instructions of the banana skill.",
+			Dir:         filepath.Join(dir, "banana"),
+		},
+		{
+			Name:        "grape",
+			Description: "Runs the grape test suite and reports failures.",
+			Body:        "Instructions of the grape skill.",
+			Dir:         filepath.Join(dir, "grape"),
+		},
 	}
 	if !reflect.DeepEqual(skills, want) {
 		t.Errorf("loadSkills = %+v\nwant %+v", skills, want)
@@ -416,6 +461,171 @@ func TestRunKeepsSystemPromptAtTheFrontOfTheConversation(t *testing.T) {
 		assistantMessage("", readCall),
 		toolMessage("call_1", "some notes\n"),
 	)
+}
+
+func TestSlashCommandName(t *testing.T) {
+	tests := []struct {
+		prompt   string
+		wantName string
+		wantOK   bool
+	}{
+		{"/apple", "apple", true},
+		{"/apple-pie_2", "apple-pie_2", true},
+		{"  /apple\n", "apple", true},
+		{"/apple and then some more words", "apple", true},
+		{"/apple\nsecond line", "apple", true},
+		{"/etc/hosts is what kind of file?", "etc/hosts", true},
+		{"/", "", true},
+		{"apple", "", false},
+		{"deploy /apple", "", false},
+		{"", "", false},
+		{"   ", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.prompt, func(t *testing.T) {
+			name, ok := slashCommandName(tt.prompt)
+
+			if name != tt.wantName || ok != tt.wantOK {
+				t.Errorf("slashCommandName(%q) = %q, %v; want %q, %v", tt.prompt, name, ok, tt.wantName, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestFindSkillPrefersFolderNameOverFrontmatterName(t *testing.T) {
+	skills := []Skill{
+		// Its frontmatter claims the name of another skill's folder.
+		{Name: "grape", Body: "apple folder", Dir: ".claude/skills/apple"},
+		{Name: "grape", Body: "grape folder", Dir: ".claude/skills/grape"},
+		{Name: "Fancy Name", Body: "pear folder", Dir: ".claude/skills/pear"},
+	}
+	tests := []struct {
+		name     string
+		wantBody string
+		wantOK   bool
+	}{
+		{"apple", "apple folder", true},
+		{"grape", "grape folder", true},
+		{"pear", "pear folder", true},
+		{"Fancy Name", "pear folder", true},
+		{"banana", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			skill, ok := findSkill(skills, tt.name)
+
+			if skill.Body != tt.wantBody || ok != tt.wantOK {
+				t.Errorf("findSkill(%q) = %+v, %v; want the skill with body %q, %v", tt.name, skill, ok, tt.wantBody, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestRunInvokesSkillByName(t *testing.T) {
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, skillsDir, "apple", skillFile), lines(
+		"---",
+		"name: apple",
+		"description: Reports the deploy target for the apple service.",
+		"---",
+		"",
+		"Respond with exactly one word: blueberry",
+		"",
+		"Do not add any other text, punctuation, or formatting.",
+	))
+	writeFile(t, filepath.Join(project, skillsDir, "grape", skillFile), lines(
+		"---",
+		"name: grape",
+		"description: Reports the deploy target for the grape service.",
+		"---",
+		"",
+		"Respond with exactly one word: raspberry",
+	))
+	t.Chdir(project)
+
+	for _, prompt := range []string{"/apple", " /apple\n", "/apple "} {
+		t.Run(prompt, func(t *testing.T) {
+			llm := newFakeLLM(t, assistantText("blueberry"))
+
+			stdout, stderr, code := runCLI(t, llm, "-p", prompt)
+
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout != "blueberry" {
+				t.Errorf("stdout = %q, want %q", stdout, "blueberry")
+			}
+			// The body of the invoked skill replaces the prompt; the other
+			// skill stays advertised by name and description only.
+			request := llm.onlyRequest()
+			assertMessages(t, request,
+				systemMessage("You have access to the following skills:\n"+
+					"\n"+
+					"- apple: Reports the deploy target for the apple service.\n"+
+					"- grape: Reports the deploy target for the grape service."),
+				userMessage("Respond with exactly one word: blueberry\n\nDo not add any other text, punctuation, or formatting."),
+			)
+			if strings.Contains(toJSON(t, request.Body), "raspberry") {
+				t.Errorf("the request discloses the body of a skill that was not invoked: %s", toJSON(t, request.Body))
+			}
+		})
+	}
+}
+
+func TestRunSendsPromptAsIsWhenItNamesNoSkill(t *testing.T) {
+	project := t.TempDir()
+	writeSkill(t, filepath.Join(project, skillsDir), "apple", "Deploys the apple service to production.")
+	t.Chdir(project)
+
+	for _, prompt := range []string{
+		"/etc/hosts is what kind of file?",
+		"/banana",
+		"/",
+		"How do I use /apple?",
+	} {
+		t.Run(prompt, func(t *testing.T) {
+			llm := newFakeLLM(t, assistantText("answer"))
+
+			_, stderr, code := runCLI(t, llm, "-p", prompt)
+
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			assertMessages(t, llm.onlyRequest(),
+				systemMessage("You have access to the following skills:\n\n- apple: Deploys the apple service to production."),
+				userMessage(prompt),
+			)
+		})
+	}
+}
+
+func TestRunRejectsSkillWithoutInstructions(t *testing.T) {
+	project := t.TempDir()
+	writeFile(t, filepath.Join(project, skillsDir, "apple", skillFile), lines(
+		"---",
+		"name: apple",
+		"description: Has a frontmatter but no body.",
+		"---",
+		"",
+	))
+	t.Chdir(project)
+	llm := newFakeLLM(t)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", "/apple")
+
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want it empty", stdout)
+	}
+	if !strings.Contains(stderr, `skill "apple" has no instructions`) {
+		t.Errorf("stderr = %q, want it to explain that the skill has no instructions", stderr)
+	}
+	if requests := llm.recorded(); len(requests) != 0 {
+		t.Errorf("LLM received %d requests, want none", len(requests))
+	}
 }
 
 func TestRunWithoutSkillsSendsNoSystemPrompt(t *testing.T) {
