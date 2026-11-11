@@ -55,9 +55,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		baseURL = defaultBaseURL
 	}
 
+	skills, err := loadSkills(skillsDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: skills are unavailable: %v\n", err)
+	}
+
 	agent := &Agent{
 		client:  openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL)),
 		toolbox: defaultToolbox(),
+		system:  skillsPrompt(skills),
 		log:     stderr,
 	}
 	answer, err := agent.Run(ctx, *prompt)

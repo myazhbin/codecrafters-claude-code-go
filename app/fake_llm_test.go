@@ -199,6 +199,10 @@ func runCLIWithEnv(t *testing.T, env map[string]string, args ...string) (stdout,
 // The helpers below build the messages a request is expected to carry, in the
 // generic form that request bodies are decoded into.
 
+func systemMessage(content string) map[string]any {
+	return map[string]any{"role": "system", "content": content}
+}
+
 func userMessage(content string) map[string]any {
 	return map[string]any{"role": "user", "content": content}
 }

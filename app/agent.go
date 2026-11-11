@@ -15,6 +15,8 @@ import (
 type Agent struct {
 	client  openai.Client
 	toolbox Toolbox
+	// system is the system prompt that opens the conversation, if any.
+	system string
 	// log receives progress information for humans. It is never stdout, which
 	// is reserved for the final answer.
 	log io.Writer
@@ -24,7 +26,11 @@ type Agent struct {
 // answer.
 func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
 	tools := a.toolbox.Specs()
-	messages := []openai.ChatCompletionMessageParamUnion{openai.UserMessage(prompt)}
+	var messages []openai.ChatCompletionMessageParamUnion
+	if a.system != "" {
+		messages = append(messages, openai.SystemMessage(a.system))
+	}
+	messages = append(messages, openai.UserMessage(prompt))
 
 	for {
 		resp, err := a.client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{

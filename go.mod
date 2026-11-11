@@ -2,7 +2,10 @@ module github.com/codecrafters-io/claude-code-starter-go
 
 go 1.27.0
 
-require github.com/openai/openai-go/v3 v3.16.0
+require (
+	github.com/openai/openai-go/v3 v3.16.0
+	go.yaml.in/yaml/v3 v3.0.6
+)
 
 require (
 	github.com/tidwall/gjson v1.18.0 // indirect
