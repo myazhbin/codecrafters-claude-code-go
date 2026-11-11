@@ -37,10 +37,10 @@ type Toolbox []Tool
 
 // baseToolbox returns the tools that act on the project, among which the LSP
 // tool if a language server is connected. They are all that a subagent gets.
-func baseToolbox(lsp *LSPClient) Toolbox {
+func baseToolbox(lsp *languageServer) Toolbox {
 	toolbox := Toolbox{readTool, writeTool, bashTool}
 	if lsp != nil {
-		toolbox = append(toolbox, newLSPTool())
+		toolbox = append(toolbox, newLSPTool(lsp))
 	}
 	return toolbox
 }
