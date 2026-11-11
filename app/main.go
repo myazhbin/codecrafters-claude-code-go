@@ -67,7 +67,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 
 	agent := &Agent{
 		client:  openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL)),
-		toolbox: defaultToolbox(),
+		toolbox: newToolbox(skills),
 		system:  skillsPrompt(skills),
 		log:     stderr,
 	}

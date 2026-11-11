@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -384,12 +385,18 @@ func TestSkillsPrompt(t *testing.T) {
 			want: "You have access to the following skills:\n" +
 				"\n" +
 				"- apple: Deploys the apple service to production.\n" +
-				"- grape: Runs the grape test suite and reports failures.",
+				"- grape: Runs the grape test suite and reports failures.\n" +
+				"\n" +
+				"If a skill matches the user's request, call the Skill tool with its name and follow the instructions it returns.",
 		},
 		{
 			name:   "skill without description",
 			skills: []Skill{{Name: "apple"}},
-			want:   "You have access to the following skills:\n\n- apple",
+			want: "You have access to the following skills:\n" +
+				"\n" +
+				"- apple\n" +
+				"\n" +
+				"If a skill matches the user's request, call the Skill tool with its name and follow the instructions it returns.",
 		},
 		{
 			name:   "no skills",
@@ -426,10 +433,10 @@ func TestRunAdvertisesSkillsInSystemPrompt(t *testing.T) {
 	}
 	// Names and descriptions only: the bodies are not disclosed yet.
 	assertMessages(t, llm.onlyRequest(),
-		systemMessage("You have access to the following skills:\n"+
-			"\n"+
-			"- apple: Deploys the apple service to production.\n"+
-			"- grape: Runs the grape test suite and reports failures."),
+		skillsSystemMessage(
+			"apple: Deploys the apple service to production.",
+			"grape: Runs the grape test suite and reports failures.",
+		),
 		userMessage(prompt),
 	)
 }
@@ -450,7 +457,7 @@ func TestRunKeepsSystemPromptAtTheFrontOfTheConversation(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
 	}
-	system := systemMessage("You have access to the following skills:\n\n- apple: Deploys the apple service to production.")
+	system := skillsSystemMessage("apple: Deploys the apple service to production.")
 	requests := llm.recorded()
 	if len(requests) != 2 {
 		t.Fatalf("LLM received %d requests, want 2", len(requests))
@@ -528,11 +535,11 @@ func TestRunStacksSkills(t *testing.T) {
 	writeSkillWithBody(t, filepath.Join(project, skillsDir), "melon", "Rotates credentials for the notification database.",
 		"Add this exact line to your response: papaya-$ARGUMENTS")
 	t.Chdir(project)
-	system := systemMessage("You have access to the following skills:\n" +
-		"\n" +
-		"- apple: Reports the deploy target for the apple service.\n" +
-		"- grape: Summarizes recent incidents for the payments team.\n" +
-		"- melon: Rotates credentials for the notification database.")
+	system := skillsSystemMessage(
+		"apple: Reports the deploy target for the apple service.",
+		"grape: Summarizes recent incidents for the payments team.",
+		"melon: Rotates credentials for the notification database.",
+	)
 	tests := []struct {
 		prompt       string
 		wantMessages []map[string]any
@@ -732,10 +739,10 @@ func TestRunPassesArgumentsToSkill(t *testing.T) {
 				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
 			}
 			assertMessages(t, llm.onlyRequest(),
-				systemMessage("You have access to the following skills:\n"+
-					"\n"+
-					"- apple: Echoes its arguments.\n"+
-					"- grape: Swaps its two arguments."),
+				skillsSystemMessage(
+					"apple: Echoes its arguments.",
+					"grape: Swaps its two arguments.",
+				),
 				userMessage(tt.wantInstructions),
 			)
 		})
@@ -810,10 +817,10 @@ func TestRunInvokesSkillByName(t *testing.T) {
 			// skill stays advertised by name and description only.
 			request := llm.onlyRequest()
 			assertMessages(t, request,
-				systemMessage("You have access to the following skills:\n"+
-					"\n"+
-					"- apple: Reports the deploy target for the apple service.\n"+
-					"- grape: Reports the deploy target for the grape service."),
+				skillsSystemMessage(
+					"apple: Reports the deploy target for the apple service.",
+					"grape: Reports the deploy target for the grape service.",
+				),
 				userMessage("Respond with exactly one word: blueberry\n\nDo not add any other text, punctuation, or formatting."),
 			)
 			if strings.Contains(toJSON(t, request.Body), "raspberry") {
@@ -843,7 +850,7 @@ func TestRunSendsPromptAsIsWhenItNamesNoSkill(t *testing.T) {
 				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
 			}
 			assertMessages(t, llm.onlyRequest(),
-				systemMessage("You have access to the following skills:\n\n- apple: Deploys the apple service to production."),
+				skillsSystemMessage("apple: Deploys the apple service to production."),
 				userMessage(prompt),
 			)
 		})
@@ -963,7 +970,7 @@ func TestRunExecutesScriptBundledWithSkill(t *testing.T) {
 	if stdout != "21" {
 		t.Errorf("stdout = %q, want %q", stdout, "21")
 	}
-	system := systemMessage("You have access to the following skills:\n\n- apple: Reports the size of the project data file.")
+	system := skillsSystemMessage("apple: Reports the size of the project data file.")
 	instructions := skillMessage("apple", "Run `scripts/size.sh` using the Bash tool.\n\nRespond with only the value it prints, and nothing else.")
 	requests := llm.recorded()
 	if len(requests) != 2 {
@@ -976,6 +983,194 @@ func TestRunExecutesScriptBundledWithSkill(t *testing.T) {
 		assistantMessage("", runScript),
 		toolMessage("call_1", "21\n"),
 	)
+}
+
+func TestSkillToolReturnsSkillInstructions(t *testing.T) {
+	tool := newSkillTool([]Skill{
+		{Name: "apple", Body: "Respond with exactly one word: blueberry", Dir: ".claude/skills/apple"},
+		{Name: "grape", Body: "Deploy $0 to $1. Request: $ARGUMENTS", Dir: ".claude/skills/grape"},
+		{Name: "melon", Body: "Run `scripts/checksum.sh`.", Dir: ".claude/skills/melon", Bundled: true},
+	})
+	tests := []struct {
+		name      string
+		arguments string
+		want      string
+	}{
+		{
+			name:      "by name",
+			arguments: `{"name": "apple"}`,
+			want:      "Respond with exactly one word: blueberry",
+		},
+		{
+			name:      "name written the way a user invokes it",
+			arguments: `{"name": " /apple "}`,
+			want:      "Respond with exactly one word: blueberry",
+		},
+		{
+			name:      "with arguments",
+			arguments: `{"name": "grape", "args": " api staging "}`,
+			want:      "Deploy api to staging. Request: api staging",
+		},
+		{
+			name:      "placeholders without arguments",
+			arguments: `{"name": "grape"}`,
+			want:      "Deploy  to . Request: ",
+		},
+		{
+			name:      "arguments for a skill without placeholders",
+			arguments: `{"name": "apple", "args": "quickly"}`,
+			want:      "Respond with exactly one word: blueberry\n\nARGUMENTS: quickly",
+		},
+		{
+			name:      "skill that bundles files",
+			arguments: `{"name": "melon"}`,
+			want: "Skill: melon (located at .claude/skills/melon)\n" +
+				"Paths in the instructions below are relative to that folder.\n" +
+				"\n" +
+				"Run `scripts/checksum.sh`.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tool.Run(context.Background(), tt.arguments)
+
+			if err != nil {
+				t.Fatalf("Skill returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("Skill = %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSkillToolRejectsBadCalls(t *testing.T) {
+	tool := newSkillTool([]Skill{
+		{Name: "apple", Body: "Respond with exactly one word: blueberry", Dir: ".claude/skills/apple"},
+		{Name: "grape", Dir: ".claude/skills/grape"},
+	})
+	tests := []struct {
+		name      string
+		arguments string
+		wantErr   string
+	}{
+		{"malformed JSON", `{"name": `, "invalid arguments"},
+		{"empty arguments", ``, "invalid arguments"},
+		{"wrong argument type", `{"name": ["apple"]}`, "invalid arguments"},
+		{"missing name", `{}`, "name is required"},
+		{"blank name", `{"name": "  "}`, "name is required"},
+		{"unknown skill", `{"name": "pear"}`, `unknown skill "pear"; the available skills are: apple, grape`},
+		{"skill without instructions", `{"name": "grape"}`, `skill "grape" has no instructions`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tool.Run(context.Background(), tt.arguments)
+
+			if err == nil {
+				t.Fatalf("Skill = %q, want an error mentioning %q", got, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunAdvertisesSkillToolWhenProjectHasSkills(t *testing.T) {
+	project := t.TempDir()
+	writeSkill(t, filepath.Join(project, skillsDir), "apple", "Use this skill when the user asks for the database migration status.")
+	t.Chdir(project)
+	llm := newFakeLLM(t, assistantText("4"))
+
+	_, stderr, code := runCLI(t, llm, "-p", "How many tools are available to you in this request? Number only.")
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	want := decodeJSON(t, `{
+		"type": "function",
+		"function": {
+			"name": "Skill",
+			"description": "Load a skill's instructions into the conversation",
+			"parameters": {
+				"type": "object",
+				"required": ["name"],
+				"properties": {
+					"name": { "type": "string", "description": "The name of the skill to use" },
+					"args": { "type": "string", "description": "Optional arguments for the skill" }
+				}
+			}
+		}
+	}`)
+	tools := advertisedTools(t, llm.onlyRequest())
+	if got := tools["Skill"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("Skill tool = %s\nwant %s", toJSON(t, got), toJSON(t, want))
+	}
+	for _, name := range []string{"Read", "Write", "Bash"} {
+		if tools[name] == nil {
+			t.Errorf("the %s tool is no longer advertised", name)
+		}
+	}
+	if len(tools) != 4 {
+		t.Errorf("advertised %d tools, want 4: %s", len(tools), toJSON(t, tools))
+	}
+}
+
+func TestRunLetsModelChooseSkill(t *testing.T) {
+	const prompt = "What is the database migration status?"
+	project := t.TempDir()
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "apple",
+		"Use this skill when the user asks for the database migration status.",
+		"Respond with exactly one word: blueberry")
+	writeSkillWithBody(t, filepath.Join(project, skillsDir), "grape",
+		"Use this skill when the user asks to format source code.",
+		"Respond with exactly one word: raspberry")
+	t.Chdir(project)
+	useSkill := toolCall{id: "call_1", name: "Skill", arguments: `{"name": "apple"}`}
+	llm := newFakeLLM(t,
+		assistantToolCalls(useSkill),
+		assistantText("blueberry"),
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", prompt)
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "blueberry" {
+		t.Errorf("stdout = %q, want %q", stdout, "blueberry")
+	}
+	system := skillsSystemMessage(
+		"apple: Use this skill when the user asks for the database migration status.",
+		"grape: Use this skill when the user asks to format source code.",
+	)
+	requests := llm.recorded()
+	if len(requests) != 2 {
+		t.Fatalf("LLM received %d requests, want 2", len(requests))
+	}
+	// The prompt goes out as it is: the model is the one to pick the skill.
+	assertMessages(t, requests[0], system, userMessage(prompt))
+	assertMessages(t, requests[1],
+		system,
+		userMessage(prompt),
+		assistantMessage("", useSkill),
+		toolMessage("call_1", "Respond with exactly one word: blueberry"),
+	)
+	for i, request := range requests {
+		if strings.Contains(toJSON(t, request.Body), "raspberry") {
+			t.Errorf("request #%d discloses the body of a skill that was not chosen", i+1)
+		}
+	}
+}
+
+// skillsSystemMessage is the system message that advertises the skills of the
+// project, each given as "name: description".
+func skillsSystemMessage(skills ...string) map[string]any {
+	return systemMessage("You have access to the following skills:\n" +
+		"\n" +
+		"- " + strings.Join(skills, "\n- ") + "\n" +
+		"\n" +
+		"If a skill matches the user's request, call the Skill tool with its name and follow the instructions it returns.")
 }
 
 // skillMessage is the user message that hands the instructions of an invoked

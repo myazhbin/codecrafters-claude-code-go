@@ -205,7 +205,7 @@ func TestToolboxCallDispatchesByName(t *testing.T) {
 }
 
 func TestToolboxCallRejectsUnknownTool(t *testing.T) {
-	_, err := defaultToolbox().Call(context.Background(), "Teleport", `{}`)
+	_, err := newToolbox(nil).Call(context.Background(), "Teleport", `{}`)
 
 	if err == nil || !strings.Contains(err.Error(), `unknown tool "Teleport"`) {
 		t.Errorf("error = %v, want it to report the unknown tool", err)

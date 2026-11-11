@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/openai/openai-go/v3"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -304,7 +306,7 @@ func substituteArguments(body, arguments string) string {
 
 // skillsPrompt returns the system prompt that advertises the skills to the
 // model, or "" if there is no skill. It discloses names and descriptions only:
-// the instructions of a skill are loaded when the skill is used.
+// the model loads the instructions of the skill it needs with the Skill tool.
 func skillsPrompt(skills []Skill) string {
 	if len(skills) == 0 {
 		return ""
@@ -316,5 +318,63 @@ func skillsPrompt(skills []Skill) string {
 			lines[i] += ": " + skill.Description
 		}
 	}
-	return "You have access to the following skills:\n\n" + strings.Join(lines, "\n")
+	return "You have access to the following skills:\n" +
+		"\n" +
+		strings.Join(lines, "\n") + "\n" +
+		"\n" +
+		"If a skill matches the user's request, call the Skill tool with its name and follow the instructions it returns."
+}
+
+// newSkillTool returns the tool that lets the model use one of the skills on
+// its own initiative: the tool hands the skill's instructions to the model.
+func newSkillTool(skills []Skill) Tool {
+	return Tool{
+		Name:        "Skill",
+		Description: "Load a skill's instructions into the conversation",
+		Parameters: openai.FunctionParameters{
+			"type":     "object",
+			"required": []string{"name"},
+			"properties": map[string]any{
+				"name": map[string]any{
+					"type":        "string",
+					"description": "The name of the skill to use",
+				},
+				"args": map[string]any{
+					"type":        "string",
+					"description": "Optional arguments for the skill",
+				},
+			},
+		},
+		Run: func(_ context.Context, arguments string) (string, error) {
+			var args struct {
+				Name string `json:"name"`
+				Args string `json:"args"`
+			}
+			if err := decodeArguments(arguments, &args); err != nil {
+				return "", err
+			}
+			// Models sometimes write the name the way a user invokes it.
+			name := strings.TrimPrefix(strings.TrimSpace(args.Name), "/")
+			if name == "" {
+				return "", errors.New("name is required")
+			}
+			skill, found := findSkill(skills, name)
+			if !found {
+				return "", fmt.Errorf("unknown skill %q; the available skills are: %s", name, skillNames(skills))
+			}
+			if skill.Body == "" {
+				return "", fmt.Errorf("skill %q has no instructions", skill.Name)
+			}
+			return skill.Prompt(strings.TrimSpace(args.Args)), nil
+		},
+	}
+}
+
+// skillNames lists the names of the skills, separated by commas.
+func skillNames(skills []Skill) string {
+	names := make([]string, len(skills))
+	for i, skill := range skills {
+		names[i] = skill.Name
+	}
+	return strings.Join(names, ", ")
 }

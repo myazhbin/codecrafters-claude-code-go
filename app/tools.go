@@ -34,9 +34,15 @@ func (t Tool) Spec() openai.ChatCompletionToolUnionParam {
 // Toolbox is a set of tools offered to the model.
 type Toolbox []Tool
 
-// defaultToolbox returns the tools this program offers to the model.
-func defaultToolbox() Toolbox {
-	return Toolbox{readTool, writeTool, bashTool}
+// newToolbox returns the tools this program offers to the model: the tools
+// that act on the project and, if the project has skills, the tool that loads
+// them.
+func newToolbox(skills []Skill) Toolbox {
+	toolbox := Toolbox{readTool, writeTool, bashTool}
+	if len(skills) > 0 {
+		toolbox = append(toolbox, newSkillTool(skills))
+	}
+	return toolbox
 }
 
 // Specs returns the specification of every tool, to be sent with each request.
