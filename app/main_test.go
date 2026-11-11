@@ -36,15 +36,15 @@ func TestRunSendsPromptAndPrintsReply(t *testing.T) {
 }
 
 func TestRunAdvertisesTools(t *testing.T) {
-	llm := newFakeLLM(t, assistantText("2"))
+	llm := newFakeLLM(t, assistantText("3"))
 
 	stdout, stderr, code := runCLI(t, llm, "-p", "How many tools are available to you in this request? Number only.")
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
 	}
-	if stdout != "2" {
-		t.Errorf("stdout = %q, want %q", stdout, "2")
+	if stdout != "3" {
+		t.Errorf("stdout = %q, want %q", stdout, "3")
 	}
 
 	want := map[string]string{
@@ -81,6 +81,23 @@ func TestRunAdvertisesTools(t *testing.T) {
 						"content": {
 							"type": "string",
 							"description": "The content to write to the file"
+						}
+					}
+				}
+			}
+		}`,
+		"Bash": `{
+			"type": "function",
+			"function": {
+				"name": "Bash",
+				"description": "Execute a shell command",
+				"parameters": {
+					"type": "object",
+					"required": ["command"],
+					"properties": {
+						"command": {
+							"type": "string",
+							"description": "The command to execute"
 						}
 					}
 				}

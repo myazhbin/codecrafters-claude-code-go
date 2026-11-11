@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ func TestReadToolReturnsExactFileContents(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeTempFile(t, "apple.py", tt.contents)
 
-			got, err := readTool.Run(jsonArgs(t, map[string]any{"file_path": path}))
+			got, err := readTool.Run(context.Background(), jsonArgs(t, map[string]any{"file_path": path}))
 
 			if err != nil {
 				t.Fatalf("Read returned an error: %v", err)
@@ -40,7 +41,7 @@ func TestReadToolResolvesRelativePathsAgainstWorkingDirectory(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "notes.txt"), "relative!")
 	t.Chdir(dir)
 
-	got, err := readTool.Run(`{"file_path": "notes.txt"}`)
+	got, err := readTool.Run(context.Background(), `{"file_path": "notes.txt"}`)
 
 	if err != nil {
 		t.Fatalf("Read returned an error: %v", err)
@@ -65,7 +66,7 @@ func TestReadToolRejectsBadCalls(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := readTool.Run(tt.arguments)
+			got, err := readTool.Run(context.Background(), tt.arguments)
 
 			if err == nil {
 				t.Fatalf("Read = %q, want an error mentioning %q", got, tt.wantErr)
@@ -92,7 +93,7 @@ func TestWriteToolCreatesFileWithExactContent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "new_file.py")
 
-			result, err := writeTool.Run(jsonArgs(t, map[string]any{"file_path": path, "content": tt.content}))
+			result, err := writeTool.Run(context.Background(), jsonArgs(t, map[string]any{"file_path": path, "content": tt.content}))
 
 			if err != nil {
 				t.Fatalf("Write returned an error: %v", err)
@@ -110,7 +111,7 @@ func TestWriteToolCreatesFileWithExactContent(t *testing.T) {
 func TestWriteToolOverwritesExistingFile(t *testing.T) {
 	path := writeTempFile(t, "notes.txt", "a much longer piece of old content\n")
 
-	if _, err := writeTool.Run(jsonArgs(t, map[string]any{"file_path": path, "content": "new\n"})); err != nil {
+	if _, err := writeTool.Run(context.Background(), jsonArgs(t, map[string]any{"file_path": path, "content": "new\n"})); err != nil {
 		t.Fatalf("Write returned an error: %v", err)
 	}
 
@@ -122,7 +123,7 @@ func TestWriteToolOverwritesExistingFile(t *testing.T) {
 func TestWriteToolCreatesMissingParentDirectories(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "app", "utils", "helpers.py")
 
-	if _, err := writeTool.Run(jsonArgs(t, map[string]any{"file_path": path, "content": "x = 1\n"})); err != nil {
+	if _, err := writeTool.Run(context.Background(), jsonArgs(t, map[string]any{"file_path": path, "content": "x = 1\n"})); err != nil {
 		t.Fatalf("Write returned an error: %v", err)
 	}
 
@@ -135,7 +136,7 @@ func TestWriteToolResolvesRelativePathsAgainstWorkingDirectory(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if _, err := writeTool.Run(`{"file_path": "app/main.py", "content": "relative!"}`); err != nil {
+	if _, err := writeTool.Run(context.Background(), `{"file_path": "app/main.py", "content": "relative!"}`); err != nil {
 		t.Fatalf("Write returned an error: %v", err)
 	}
 
@@ -162,7 +163,7 @@ func TestWriteToolRejectsBadCalls(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := writeTool.Run(tt.arguments)
+			got, err := writeTool.Run(context.Background(), tt.arguments)
 
 			if err == nil {
 				t.Fatalf("Write = %q, want an error mentioning %q", got, tt.wantErr)
@@ -180,17 +181,17 @@ func TestWriteToolRejectsBadCalls(t *testing.T) {
 func TestToolboxCallDispatchesByName(t *testing.T) {
 	var gotArguments string
 	toolbox := Toolbox{
-		{Name: "Other", Run: func(string) (string, error) {
+		{Name: "Other", Run: func(context.Context, string) (string, error) {
 			t.Error("the wrong tool was executed")
 			return "", nil
 		}},
-		{Name: "Echo", Run: func(arguments string) (string, error) {
+		{Name: "Echo", Run: func(_ context.Context, arguments string) (string, error) {
 			gotArguments = arguments
 			return "echoed", nil
 		}},
 	}
 
-	got, err := toolbox.Call("Echo", `{"text": "hi"}`)
+	got, err := toolbox.Call(context.Background(), "Echo", `{"text": "hi"}`)
 
 	if err != nil {
 		t.Fatalf("Call returned an error: %v", err)
@@ -204,7 +205,7 @@ func TestToolboxCallDispatchesByName(t *testing.T) {
 }
 
 func TestToolboxCallRejectsUnknownTool(t *testing.T) {
-	_, err := defaultToolbox().Call("Teleport", `{}`)
+	_, err := defaultToolbox().Call(context.Background(), "Teleport", `{}`)
 
 	if err == nil || !strings.Contains(err.Error(), `unknown tool "Teleport"`) {
 		t.Errorf("error = %v, want it to report the unknown tool", err)

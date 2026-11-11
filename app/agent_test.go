@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -149,6 +150,52 @@ func TestAgentLoopCreatesFileWithWriteTool(t *testing.T) {
 		toolMessage("call_1", readme),
 		assistantMessage("", writeCall),
 		toolMessage("call_2", "Wrote 23 bytes to app/main.py"),
+	)
+}
+
+func TestAgentLoopDeletesFileWithBashTool(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "app", "main.js"), "console.log('main');\n")
+	writeFile(t, filepath.Join(dir, "README.md"), "# Current readme\n")
+	writeFile(t, filepath.Join(dir, "README_old.md"), "# Old readme\n")
+	t.Chdir(dir)
+	// LC_ALL=C makes the order of the listing independent of the locale.
+	listCall := toolCall{id: "call_1", name: "Bash", arguments: `{"command": "LC_ALL=C ls"}`}
+	removeCall := toolCall{id: "call_2", name: "Bash", arguments: `{"command": "rm README_old.md"}`}
+	llm := newFakeLLM(t,
+		assistantToolCalls(listCall),
+		assistantToolCalls(removeCall),
+		assistantText("Deleted README_old.md"),
+	)
+
+	stdout, stderr, code := runCLI(t, llm, "-p", "Delete the old readme file.")
+
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+	}
+	if stdout != "Deleted README_old.md" {
+		t.Errorf("stdout = %q, want %q", stdout, "Deleted README_old.md")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "README_old.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("README_old.md still exists (stat error: %v)", err)
+	}
+	if got := readFile(t, filepath.Join(dir, "README.md")); got != "# Current readme\n" {
+		t.Errorf("README.md contains %q, want it untouched", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "app", "main.js")); got != "console.log('main');\n" {
+		t.Errorf("app/main.js contains %q, want it untouched", got)
+	}
+
+	requests := llm.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("LLM received %d requests, want 3", len(requests))
+	}
+	assertMessages(t, requests[2],
+		userMessage("Delete the old readme file."),
+		assistantMessage("", listCall),
+		toolMessage("call_1", "README.md\nREADME_old.md\napp\n"),
+		assistantMessage("", removeCall),
+		toolMessage("call_2", "(no output)"),
 	)
 }
 

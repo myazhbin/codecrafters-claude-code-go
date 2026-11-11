@@ -46,7 +46,7 @@ func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
 		}
 
 		for _, call := range message.ToolCalls {
-			messages = append(messages, openai.ToolMessage(a.execute(call), call.ID))
+			messages = append(messages, openai.ToolMessage(a.execute(ctx, call), call.ID))
 		}
 	}
 }
@@ -54,11 +54,11 @@ func (a *Agent) Run(ctx context.Context, prompt string) (string, error) {
 // execute runs one tool call and returns the content of the tool message that
 // reports its outcome to the model. Failures are reported to the model as
 // well, so that it can recover from them instead of the whole run aborting.
-func (a *Agent) execute(call openai.ChatCompletionMessageToolCallUnion) string {
+func (a *Agent) execute(ctx context.Context, call openai.ChatCompletionMessageToolCallUnion) string {
 	name, arguments := call.Function.Name, call.Function.Arguments
 	fmt.Fprintf(a.log, "[tool] %s %s\n", name, arguments)
 
-	result, err := a.toolbox.Call(name, arguments)
+	result, err := a.toolbox.Call(ctx, name, arguments)
 	if err != nil {
 		fmt.Fprintf(a.log, "[tool] %s failed: %v\n", name, err)
 		return "Error: " + err.Error()
