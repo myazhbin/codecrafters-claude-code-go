@@ -32,6 +32,9 @@ type Skill struct {
 	Body string
 	// Dir is the skill's folder.
 	Dir string
+	// Bundled reports whether the folder holds files besides the SKILL.md,
+	// such as scripts that the instructions tell the model to run.
+	Bundled bool
 }
 
 // skillMetadata is the part of a SKILL.md frontmatter that the program uses.
@@ -58,9 +61,26 @@ func loadSkills(dir string) ([]Skill, error) {
 		if err != nil {
 			continue // not a skill folder
 		}
-		skills = append(skills, parseSkill(skillDir, string(document)))
+		skill := parseSkill(skillDir, string(document))
+		skill.Bundled = hasBundledFiles(skillDir)
+		skills = append(skills, skill)
 	}
 	return skills, nil
+}
+
+// hasBundledFiles reports whether a skill's folder holds anything besides its
+// SKILL.md.
+func hasBundledFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.Name() != skillFile {
+			return true
+		}
+	}
+	return false
 }
 
 // parseSkill builds the skill kept in dir from the contents of its SKILL.md.
@@ -224,14 +244,22 @@ func expandSlashCommands(prompt string, skills []Skill) ([]string, error) {
 }
 
 // Prompt returns the message that hands the skill's instructions to the model,
-// with the arguments filled in. The instructions refer to the files bundled
-// with the skill, such as its scripts, by paths relative to the skill's
-// folder, so the message starts by telling the model where that folder is.
+// with the arguments filled in.
+//
+// Instructions refer to the files bundled with their skill, such as scripts,
+// by paths relative to the skill's folder. So the message for a skill that
+// bundles files starts by telling the model where that folder is. A skill made
+// of instructions alone is spared that: the folder holds nothing of use to the
+// model, and naming it only invites the model to go and look.
 func (s Skill) Prompt(arguments string) string {
+	instructions := substituteArguments(s.Body, arguments)
+	if !s.Bundled {
+		return instructions
+	}
 	return fmt.Sprintf("Skill: %s (located at %s)\n"+
 		"Paths in the instructions below are relative to that folder.\n"+
 		"\n"+
-		"%s", s.Name, s.Dir, substituteArguments(s.Body, arguments))
+		"%s", s.Name, s.Dir, instructions)
 }
 
 // argumentPlaceholder matches the placeholders of a skill's body: $ARGUMENTS,

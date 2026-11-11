@@ -317,6 +317,7 @@ func TestLoadSkillsFindsEverySkillFolder(t *testing.T) {
 			Description: "Deploys the apple service to production.",
 			Body:        "Instructions of the apple skill.",
 			Dir:         filepath.Join(dir, "apple"),
+			Bundled:     true,
 		},
 		{
 			Name:        "banana",
@@ -540,38 +541,38 @@ func TestRunStacksSkills(t *testing.T) {
 			prompt: "/apple /grape 4127",
 			wantMessages: []map[string]any{
 				system,
-				skillMessage("apple", "Add this exact line to your response: blueberry-4127"),
-				skillMessage("grape", "Add this exact line to your response: cherry-4127"),
+				userMessage("Add this exact line to your response: blueberry-4127"),
+				userMessage("Add this exact line to your response: cherry-4127"),
 			},
 		},
 		{
 			prompt: "/grape /apple 4127",
 			wantMessages: []map[string]any{
 				system,
-				skillMessage("grape", "Add this exact line to your response: cherry-4127"),
-				skillMessage("apple", "Add this exact line to your response: blueberry-4127"),
+				userMessage("Add this exact line to your response: cherry-4127"),
+				userMessage("Add this exact line to your response: blueberry-4127"),
 			},
 		},
 		{
 			prompt: "/apple 4127 /grape",
 			wantMessages: []map[string]any{
 				system,
-				skillMessage("apple", "Add this exact line to your response: blueberry-4127 /grape"),
+				userMessage("Add this exact line to your response: blueberry-4127 /grape"),
 			},
 		},
 		{
 			prompt: "/apple /pear 4127",
 			wantMessages: []map[string]any{
 				system,
-				skillMessage("apple", "Add this exact line to your response: blueberry-/pear 4127"),
+				userMessage("Add this exact line to your response: blueberry-/pear 4127"),
 			},
 		},
 		{
 			prompt: "/apple /grape",
 			wantMessages: []map[string]any{
 				system,
-				skillMessage("apple", "Add this exact line to your response: blueberry-"),
-				skillMessage("grape", "Add this exact line to your response: cherry-"),
+				userMessage("Add this exact line to your response: blueberry-"),
+				userMessage("Add this exact line to your response: cherry-"),
 			},
 		},
 	}
@@ -712,15 +713,14 @@ func TestRunPassesArgumentsToSkill(t *testing.T) {
 	t.Chdir(project)
 	tests := []struct {
 		prompt           string
-		wantSkill        string
 		wantInstructions string
 	}{
-		{"/apple 4127", "apple", "Respond with exactly this text and nothing else: 4127"},
-		{"/grape mango pear", "grape", "Respond with exactly this text and nothing else: pear mango"},
-		{"/apple staging eu-west", "apple", "Respond with exactly this text and nothing else: staging eu-west"},
-		{"/apple", "apple", "Respond with exactly this text and nothing else: "},
-		{"/grape", "grape", "Respond with exactly this text and nothing else:  "},
-		{"/grape mango", "grape", "Respond with exactly this text and nothing else:  mango"},
+		{"/apple 4127", "Respond with exactly this text and nothing else: 4127"},
+		{"/grape mango pear", "Respond with exactly this text and nothing else: pear mango"},
+		{"/apple staging eu-west", "Respond with exactly this text and nothing else: staging eu-west"},
+		{"/apple", "Respond with exactly this text and nothing else: "},
+		{"/grape", "Respond with exactly this text and nothing else:  "},
+		{"/grape mango", "Respond with exactly this text and nothing else:  mango"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.prompt, func(t *testing.T) {
@@ -736,7 +736,7 @@ func TestRunPassesArgumentsToSkill(t *testing.T) {
 					"\n"+
 					"- apple: Echoes its arguments.\n"+
 					"- grape: Swaps its two arguments."),
-				skillMessage(tt.wantSkill, tt.wantInstructions),
+				userMessage(tt.wantInstructions),
 			)
 		})
 	}
@@ -814,7 +814,7 @@ func TestRunInvokesSkillByName(t *testing.T) {
 					"\n"+
 					"- apple: Reports the deploy target for the apple service.\n"+
 					"- grape: Reports the deploy target for the grape service."),
-				skillMessage("apple", "Respond with exactly one word: blueberry\n\nDo not add any other text, punctuation, or formatting."),
+				userMessage("Respond with exactly one word: blueberry\n\nDo not add any other text, punctuation, or formatting."),
 			)
 			if strings.Contains(toJSON(t, request.Body), "raspberry") {
 				t.Errorf("the request discloses the body of a skill that was not invoked: %s", toJSON(t, request.Body))
@@ -894,23 +894,34 @@ func TestRunWithoutSkillsSendsNoSystemPrompt(t *testing.T) {
 	assertMessages(t, llm.onlyRequest(), userMessage("Which skills do you have?"))
 }
 
-func TestSkillPromptNamesTheSkillFolder(t *testing.T) {
-	skill := Skill{
-		Name: "apple",
-		Body: "Run `scripts/checksum.sh $0` using the Bash tool.\n\nRespond with only the value it prints.",
-		Dir:  ".claude/skills/apple",
+func TestSkillPrompt(t *testing.T) {
+	const body = "Run `scripts/checksum.sh $0` using the Bash tool.\n\nRespond with only the value it prints."
+	const instructions = "Run `scripts/checksum.sh data.txt` using the Bash tool.\n\nRespond with only the value it prints."
+	tests := []struct {
+		name  string
+		skill Skill
+		want  string
+	}{
+		{
+			name:  "skill that bundles files: the message says where its folder is",
+			skill: Skill{Name: "apple", Body: body, Dir: ".claude/skills/apple", Bundled: true},
+			want: "Skill: apple (located at .claude/skills/apple)\n" +
+				"Paths in the instructions below are relative to that folder.\n" +
+				"\n" +
+				instructions,
+		},
+		{
+			name:  "skill made of instructions alone: the message is the instructions",
+			skill: Skill{Name: "apple", Body: body, Dir: ".claude/skills/apple"},
+			want:  instructions,
+		},
 	}
-
-	got := skill.Prompt("data.txt")
-
-	want := "Skill: apple (located at .claude/skills/apple)\n" +
-		"Paths in the instructions below are relative to that folder.\n" +
-		"\n" +
-		"Run `scripts/checksum.sh data.txt` using the Bash tool.\n" +
-		"\n" +
-		"Respond with only the value it prints."
-	if got != want {
-		t.Errorf("Prompt = %q\nwant %q", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.skill.Prompt("data.txt"); got != tt.want {
+				t.Errorf("Prompt = %q\nwant %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -968,7 +979,7 @@ func TestRunExecutesScriptBundledWithSkill(t *testing.T) {
 }
 
 // skillMessage is the user message that hands the instructions of an invoked
-// skill of the project to the model.
+// skill of the project to the model, when that skill bundles files.
 func skillMessage(name, instructions string) map[string]any {
 	return userMessage("Skill: " + name + " (located at .claude/skills/" + name + ")\n" +
 		"Paths in the instructions below are relative to that folder.\n" +
