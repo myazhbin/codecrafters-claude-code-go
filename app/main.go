@@ -65,13 +65,17 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return 1
 	}
 
+	// The language server, if any, is connected before the first request to
+	// the model, and for the whole run.
+	tools := baseToolbox(connectLSP(stderr))
+
 	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL))
 	// A subagent is the same loop run over a conversation of its own: it knows
 	// nothing of the skills, and can only act on the project.
-	subagent := &Agent{client: client, toolbox: baseToolbox(), log: stderr}
+	subagent := &Agent{client: client, toolbox: tools, log: stderr}
 	agent := &Agent{
 		client: client,
-		toolbox: newToolbox(skills, func(ctx context.Context, prompt string) (string, error) {
+		toolbox: newToolbox(tools, skills, func(ctx context.Context, prompt string) (string, error) {
 			return subagent.Run(ctx, []string{prompt})
 		}),
 		system: skillsPrompt(skills),

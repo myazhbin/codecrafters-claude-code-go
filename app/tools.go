@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/openai/openai-go/v3"
 )
@@ -34,17 +35,21 @@ func (t Tool) Spec() openai.ChatCompletionToolUnionParam {
 // Toolbox is a set of tools offered to the model.
 type Toolbox []Tool
 
-// baseToolbox returns the tools that act on the project. They are all that a
-// subagent gets.
-func baseToolbox() Toolbox {
-	return Toolbox{readTool, writeTool, bashTool}
+// baseToolbox returns the tools that act on the project, among which the LSP
+// tool if a language server is connected. They are all that a subagent gets.
+func baseToolbox(lsp *LSPClient) Toolbox {
+	toolbox := Toolbox{readTool, writeTool, bashTool}
+	if lsp != nil {
+		toolbox = append(toolbox, newLSPTool())
+	}
+	return toolbox
 }
 
-// newToolbox returns the tools offered to the main agent: the tools that act
-// on the project and, if the project has skills, the tool that uses them,
-// which runs the skills that ask for a subagent with fork.
-func newToolbox(skills []Skill, fork forkFunc) Toolbox {
-	toolbox := baseToolbox()
+// newToolbox returns the tools offered to the main agent: the base tools and,
+// if the project has skills, the tool that uses them, which runs the skills
+// that ask for a subagent with fork.
+func newToolbox(base Toolbox, skills []Skill, fork forkFunc) Toolbox {
+	toolbox := slices.Clone(base)
 	if len(skills) > 0 {
 		toolbox = append(toolbox, newSkillTool(skills, fork))
 	}
