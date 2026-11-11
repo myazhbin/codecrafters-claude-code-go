@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -21,10 +22,20 @@ import (
 // told about the project's files.
 type languageServer struct {
 	client *LSPClient
-	// opened holds the URIs of the documents sent to the server. The server
-	// needs a document before it can answer about it, and rejects a document
-	// that is sent twice.
-	opened map[string]bool
+	// documents holds the files sent to the server, by URI. The server needs
+	// a file before it can answer about it, rejects a file that is opened
+	// twice, and only learns that a file has changed when it is told so.
+	documents map[string]*document
+}
+
+// document is a file as the language server knows it.
+type document struct {
+	path string
+	// version numbers the texts of the file sent to the server: 1 for the
+	// text that opened the document, and one more with every change.
+	version int
+	// text is the latest text of the file sent to the server.
+	text string
 }
 
 // connectLSP connects to the language server that the environment configures,
@@ -40,7 +51,7 @@ func connectLSP(log io.Writer) *languageServer {
 		return nil
 	}
 	fmt.Fprintln(log, "LSP client connected")
-	return &languageServer{client: client, opened: map[string]bool{}}
+	return &languageServer{client: client, documents: map[string]*document{}}
 }
 
 // The types below are the parts of the Language Server Protocol that the
@@ -69,37 +80,145 @@ type lspLocation struct {
 	Range lspRange `json:"range"`
 }
 
-// open sends the document at path to the server, unless the server has it
-// already, and returns the URI that identifies the document.
+// open sends the file at path to the server, unless the server has it
+// already, and returns the URI that identifies it.
 func (s *languageServer) open(path string) (uri string, err error) {
 	uri = fileURI(path)
-	if s.opened[uri] {
+	if s.documents[uri] != nil {
 		return uri, nil
 	}
-	language, known := s.client.ExtensionToLanguage[filepath.Ext(path)]
-	if !known {
+	if !s.handles(path) {
 		return "", fmt.Errorf("no language server is configured for files like %s", filepath.Base(path))
 	}
 	text, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
-	_, err = s.client.Call("notify", lspMessage{
+	return uri, s.didOpen(path, string(text))
+}
+
+// saved tells the server that the file at path was saved with a new text, so
+// that its answers are about the code as it now is. Files that the server
+// does not analyze are none of its business.
+func (s *languageServer) saved(path string) error {
+	if !s.handles(path) {
+		return nil
+	}
+	text, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if document := s.documents[fileURI(path)]; document != nil {
+		return s.didChange(document, string(text))
+	}
+	return s.didOpen(path, string(text))
+}
+
+// refresh tells the server about the files it has that were changed behind
+// its back, as a shell command can do.
+func (s *languageServer) refresh() error {
+	var failures []error
+	for _, uri := range slices.Sorted(maps.Keys(s.documents)) {
+		document := s.documents[uri]
+		text, err := os.ReadFile(document.path)
+		if err != nil || string(text) == document.text {
+			continue // gone or untouched: nothing to tell
+		}
+		if err := s.didChange(document, string(text)); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// handles reports whether the server analyzes files like the one at path.
+func (s *languageServer) handles(path string) bool {
+	_, known := s.client.ExtensionToLanguage[filepath.Ext(path)]
+	return known
+}
+
+// didOpen sends the server a file that it does not have yet.
+func (s *languageServer) didOpen(path, text string) error {
+	uri := fileURI(path)
+	_, err := s.client.Call("notify", lspMessage{
 		Method: "textDocument/didOpen",
 		Params: map[string]any{
 			"textDocument": map[string]any{
 				"uri":        uri,
-				"languageId": language,
+				"languageId": s.client.ExtensionToLanguage[filepath.Ext(path)],
 				"version":    1,
-				"text":       string(text),
+				"text":       text,
 			},
 		},
 	})
 	if err != nil {
-		return "", err
+		return err
 	}
-	s.opened[uri] = true
-	return uri, nil
+	s.documents[uri] = &document{path: path, version: 1, text: text}
+	return nil
+}
+
+// didChange sends the server the new text of a file that it has. The text
+// replaces the previous one as a whole, under the next version number, which
+// only becomes the document's once the server has taken the change.
+func (s *languageServer) didChange(document *document, text string) error {
+	version := document.version + 1
+	_, err := s.client.Call("notify", lspMessage{
+		Method: "textDocument/didChange",
+		Params: map[string]any{
+			"textDocument":   map[string]any{"uri": fileURI(document.path), "version": version},
+			"contentChanges": []any{map[string]any{"text": text}},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	document.version, document.text = version, text
+	return nil
+}
+
+// trackWrites returns the Write tool extended to tell the server about every
+// file it saves, before it reports to the model.
+func (s *languageServer) trackWrites(write Tool) Tool {
+	return thenSync(write, func(arguments string) error {
+		var args struct {
+			FilePath string `json:"file_path"`
+		}
+		if err := decodeArguments(arguments, &args); err != nil {
+			return err
+		}
+		path, err := filepath.Abs(args.FilePath)
+		if err != nil {
+			return err
+		}
+		return s.saved(path)
+	})
+}
+
+// trackCommands returns the Bash tool extended to tell the server about the
+// files that a command has changed, before it reports to the model.
+func (s *languageServer) trackCommands(bash Tool) Tool {
+	return thenSync(bash, func(string) error {
+		return s.refresh()
+	})
+}
+
+// thenSync returns the tool extended to call sync, with the arguments of the
+// call, once it has done its job. A failure of sync does not undo that job: it
+// is reported along with the tool's result.
+func thenSync(tool Tool, sync func(arguments string) error) Tool {
+	run := tool.Run
+	tool.Run = func(ctx context.Context, arguments string) (string, error) {
+		result, err := run(ctx, arguments)
+		if err != nil {
+			return result, err
+		}
+		if err := sync(arguments); err != nil {
+			result = appendLine(result, "Warning: the language server may be out of date: "+strings.TrimSpace(err.Error()))
+		}
+		return result, nil
+	}
+	return tool
 }
 
 // definition returns where the symbol at the given position of the file at
@@ -167,7 +286,8 @@ func newLSPTool(server *languageServer) Tool {
 		Description: "Asks the language server about the symbol at a position of a file. " +
 			"goToDefinition returns the file, line, and character where the symbol is defined. " +
 			"findReferences returns the file, line, and character of every reference to the symbol, " +
-			"such as the calls of a function, including through aliases.",
+			"such as the calls of a function, including through aliases. " +
+			"Save your edits with the Write tool: the language server then answers about the new code.",
 		Parameters: openai.FunctionParameters{
 			"type": "object",
 			"properties": map[string]any{

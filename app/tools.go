@@ -35,14 +35,19 @@ func (t Tool) Spec() openai.ChatCompletionToolUnionParam {
 // Toolbox is a set of tools offered to the model.
 type Toolbox []Tool
 
-// baseToolbox returns the tools that act on the project, among which the LSP
-// tool if a language server is connected. They are all that a subagent gets.
+// baseToolbox returns the tools that act on the project. They are all that a
+// subagent gets. If a language server is connected, the LSP tool is among
+// them, and the tools that change files keep the server up to date.
 func baseToolbox(lsp *languageServer) Toolbox {
-	toolbox := Toolbox{readTool, writeTool, bashTool}
-	if lsp != nil {
-		toolbox = append(toolbox, newLSPTool(lsp))
+	if lsp == nil {
+		return Toolbox{readTool, writeTool, bashTool}
 	}
-	return toolbox
+	return Toolbox{
+		readTool,
+		lsp.trackWrites(writeTool),
+		lsp.trackCommands(bashTool),
+		newLSPTool(lsp),
+	}
 }
 
 // newToolbox returns the tools offered to the main agent: the base tools and,

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -25,21 +26,29 @@ func TestMain(m *testing.M) {
 // fakeLSP stands in for the course's LSP transport and the language server
 // behind it: an HTTP endpoint with one path per action of the supplied client.
 // It records the calls it receives, answers requests with the scripted
-// results and, like the real server, remembers the documents it was sent.
+// results and, like the real server, keeps the documents it is sent.
 type fakeLSP struct {
 	t      *testing.T
 	server *httptest.Server
 
 	mu sync.Mutex
-	// results holds the scripted result of the requests, by method.
+	// results holds the scripted result of the requests, by method: a value,
+	// or a func(text string) any that makes the result out of the server's
+	// copy of the document that the request is about.
 	results map[string]any
 	// failures holds how many of the next messages of a method must fail.
 	failures map[string]int
-	// opened holds the URIs of the documents received with didOpen.
-	opened map[string]bool
-	calls  []lspCall
+	// documents holds the server's copy of the documents it was sent, by URI.
+	documents map[string]fakeDocument
+	calls     []lspCall
 	// onCall, if set, is called for every action received.
 	onCall func(action string)
+}
+
+// fakeDocument is the fake server's copy of a document.
+type fakeDocument struct {
+	Version int
+	Text    string
 }
 
 // lspCall is one call received by the fake LSP transport.
@@ -54,10 +63,10 @@ type lspCall struct {
 func newFakeLSP(t *testing.T) *fakeLSP {
 	t.Helper()
 	lsp := &fakeLSP{
-		t:        t,
-		results:  map[string]any{},
-		failures: map[string]int{},
-		opened:   map[string]bool{},
+		t:         t,
+		results:   map[string]any{},
+		failures:  map[string]int{},
+		documents: map[string]fakeDocument{},
 	}
 	lsp.server = httptest.NewServer(http.HandlerFunc(lsp.handle))
 	t.Cleanup(lsp.server.Close)
@@ -128,25 +137,54 @@ func (f *fakeLSP) answer(call lspCall) (status int, response any) {
 	}
 	textDocument, _ := call.Params["textDocument"].(map[string]any)
 	uri, _ := textDocument["uri"].(string)
+	version, _ := textDocument["version"].(float64)
+	document, open := f.documents[uri]
 	switch {
 	case call.Action == "notify" && call.Method == "textDocument/didOpen":
-		if f.opened[uri] {
+		if open {
 			return http.StatusBadRequest, "document is already open: " + uri
 		}
-		f.opened[uri] = true
+		text, _ := textDocument["text"].(string)
+		f.documents[uri] = fakeDocument{Version: int(version), Text: text}
+		return http.StatusOK, map[string]any{}
+	case call.Action == "notify" && call.Method == "textDocument/didChange":
+		if !open {
+			return http.StatusBadRequest, "document is not open: " + uri
+		}
+		if int(version) <= document.Version {
+			return http.StatusBadRequest, "version does not go up: " + uri
+		}
+		changes, _ := call.Params["contentChanges"].([]any)
+		if len(changes) != 1 {
+			return http.StatusBadRequest, "want the full text as the one content change: " + uri
+		}
+		change, _ := changes[0].(map[string]any)
+		text, _ := change["text"].(string)
+		f.documents[uri] = fakeDocument{Version: int(version), Text: text}
 		return http.StatusOK, map[string]any{}
 	case call.Action == "request":
-		if !f.opened[uri] {
+		if !open {
 			return http.StatusBadRequest, "document is not open: " + uri
 		}
 		result, scripted := f.results[call.Method]
 		if !scripted {
 			return http.StatusNotFound, "no result scripted for " + call.Method
 		}
+		if resultFor, dynamic := result.(func(text string) any); dynamic {
+			result = resultFor(document.Text)
+		}
 		return http.StatusOK, result
 	default:
 		return http.StatusNotFound, "unexpected " + call.Action + " " + call.Method
 	}
+}
+
+// copyOf returns the server's copy of the file at path, if it was sent it.
+func (f *fakeLSP) copyOf(path string) (document fakeDocument, open bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	document, open = f.documents[fileURI(path)]
+	return document, open
 }
 
 // received returns the calls received so far.
@@ -183,8 +221,8 @@ func locationOf(path string, startLine, startCharacter, endLine, endCharacter in
 }
 
 // The invoice project: checkout.py calls pricing.total under another name and
-// reports.py under its own, while preview.py has an unrelated function of the
-// same name.
+// reports.py under its own, while discounts.py and preview.py have unrelated
+// functions of the same name.
 const (
 	checkoutSource = "from pricing import total as invoice_total\n" +
 		"\n" +
@@ -198,8 +236,18 @@ const (
 		"\n" +
 		"def report(orders, refunds):\n" +
 		"    return total(orders) - total(refunds)\n"
+	discountsSource = "def total(items):\n" +
+		"    return 0\n"
 	previewSource = "def total(lines):\n" +
 		"    return len(lines)\n"
+
+	// discountedCheckoutSource is checkout.py once it imports total from
+	// discounts rather than from pricing.
+	discountedCheckoutSource = "from discounts import total as invoice_total\n" +
+		"\n" +
+		"\n" +
+		"def checkout(items):\n" +
+		"    return invoice_total(items)\n"
 )
 
 // newInvoiceProject creates the invoice project in a new directory, makes it
@@ -210,6 +258,7 @@ func newInvoiceProject(t *testing.T) string {
 	writeFile(t, filepath.Join(project, "checkout.py"), checkoutSource)
 	writeFile(t, filepath.Join(project, "pricing.py"), pricingSource)
 	writeFile(t, filepath.Join(project, "reports.py"), reportsSource)
+	writeFile(t, filepath.Join(project, "discounts.py"), discountsSource)
 	writeFile(t, filepath.Join(project, "preview.py"), previewSource)
 	t.Chdir(project)
 	return project
@@ -225,13 +274,53 @@ func newConnectedLSPTool(t *testing.T) Tool {
 	return newLSPTool(server)
 }
 
+// newConnectedToolbox returns the tools of an agent that is connected to the
+// fake LSP transport.
+func newConnectedToolbox(t *testing.T) Toolbox {
+	t.Helper()
+	server := connectLSP(io.Discard)
+	if server == nil {
+		t.Fatal("cannot connect to the fake LSP transport")
+	}
+	return baseToolbox(server)
+}
+
+// followCheckoutImport scripts where invoice_total, in checkout.py, is
+// defined: in the module that the server's copy of checkout.py imports it
+// from.
+func followCheckoutImport(lsp *fakeLSP, project string) {
+	lsp.script("textDocument/definition", func(text string) any {
+		module := "pricing.py"
+		if strings.HasPrefix(text, "from discounts import") {
+			module = "discounts.py"
+		}
+		return locationOf(filepath.Join(project, module), 0, 4, 0, 9)
+	})
+}
+
+// notifications summarizes the notifications that the fake server received
+// about documents, as in "textDocument/didChange checkout.py v2".
+func (f *fakeLSP) notifications() []string {
+	var notifications []string
+	for _, call := range f.received() {
+		if call.Action != "notify" {
+			continue
+		}
+		textDocument, _ := call.Params["textDocument"].(map[string]any)
+		uri, _ := textDocument["uri"].(string)
+		version, _ := textDocument["version"].(float64)
+		notifications = append(notifications, fmt.Sprintf("%s %s v%d", call.Method, filepath.Base(pathFromURI(uri)), int(version)))
+	}
+	return notifications
+}
+
 // lspToolSpec is the specification of the LSP tool that every request must
 // advertise while a language server is connected.
 const lspToolSpec = `{
 	"type": "function",
 	"function": {
 		"name": "LSP",
-		"description": "Asks the language server about the symbol at a position of a file. goToDefinition returns the file, line, and character where the symbol is defined. findReferences returns the file, line, and character of every reference to the symbol, such as the calls of a function, including through aliases.",
+		"description": "Asks the language server about the symbol at a position of a file. goToDefinition returns the file, line, and character where the symbol is defined. findReferences returns the file, line, and character of every reference to the symbol, such as the calls of a function, including through aliases. Save your edits with the Write tool: the language server then answers about the new code.",
 		"parameters": {
 			"type": "object",
 			"properties": {
